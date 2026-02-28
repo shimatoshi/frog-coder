@@ -1,0 +1,22 @@
+# Auth tokens
+auth.json
+.ai-coder/
+
+# Environment
+.env
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Logs
+*.log
