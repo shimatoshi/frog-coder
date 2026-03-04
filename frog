@@ -1218,19 +1218,33 @@ function showStatus() {
 
 // ====== Character Width ======
 function isWideChar(char) {
+  if (!char) return false;
   const c = char.codePointAt(0);
-  // CJK, Hiragana, Katakana, Hangul, Fullwidth forms
-  return c >= 0x1100 && (
-    c <= 0x115F ||
-    (c >= 0x2E80 && c <= 0x303E) ||
+  return (
+    // Hangul Jamo
+    (c >= 0x1100 && c <= 0x115F) ||
+    (c >= 0x11A3 && c <= 0x11A7) ||
+    (c >= 0x11FA && c <= 0x11FF) ||
+    // CJK Radicals, Kangxi, Ideographic Description
+    (c >= 0x2E80 && c <= 0x2FFF) ||
+    // CJK Symbols and Punctuation (includes 。「」etc)
+    (c >= 0x3000 && c <= 0x303E) ||
+    // Hiragana + Katakana + Bopomofo + CJK Strokes + Katakana Ext
     (c >= 0x3040 && c <= 0x33BF) ||
+    // CJK Unified Ideographs Extension A
     (c >= 0x3400 && c <= 0x4DBF) ||
-    (c >= 0x4E00 && c <= 0xA4CF) ||
-    (c >= 0xAC00 && c <= 0xD7FF) ||
+    // CJK Unified Ideographs + Yi + Hangul
+    (c >= 0x4E00 && c <= 0xD7FF) ||
+    // CJK Compatibility Ideographs
     (c >= 0xF900 && c <= 0xFAFF) ||
+    // Vertical forms + CJK Compatibility Forms + Small Forms
     (c >= 0xFE10 && c <= 0xFE6F) ||
+    // Fullwidth forms (！～～)
     (c >= 0xFF01 && c <= 0xFF60) ||
+    // Fullwidth currency symbols (￠￥etc)
     (c >= 0xFFE0 && c <= 0xFFE6) ||
+    // CJK Ext B, C, D, E, F + CJK Compat Supplement
+    (c >= 0x1F000 && c <= 0x1F9FF) || // Emoji (most are wide)
     (c >= 0x20000 && c <= 0x3FFFF)
   );
 }
@@ -1283,22 +1297,21 @@ function readUserInput() {
           continue;
         }
 
-        // Backspace - delete last character (handles wide chars)
+        // Backspace - delete last character, redraw line to avoid ghost chars
         if (byte === 127 || byte === 8) {
           const currentLine = lines[lines.length - 1];
           if (currentLine.length > 0) {
             const chars = [...currentLine]; // Split by codepoints, not bytes
-            const removed = chars.pop();
+            chars.pop();
             lines[lines.length - 1] = chars.join("");
-            if (isWideChar(removed)) {
-              process.stdout.write("\b \b\b \b"); // 2 columns
-            } else {
-              process.stdout.write("\b \b"); // 1 column
-            }
+            // Redraw current line from scratch to prevent display artifacts
+            const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
+            process.stdout.write("\r\x1b[K" + prefix + lines[lines.length - 1]);
           } else if (lines.length > 1) {
             lines.pop();
-            // Redraw previous line
-            process.stdout.write("\x1b[A\r\x1b[K\x1b[90m│\x1b[0m " + lines[lines.length - 1]);
+            // Move up, clear line, redraw previous line
+            const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
+            process.stdout.write("\x1b[A\r\x1b[K" + prefix + lines[lines.length - 1]);
           }
           continue;
         }
