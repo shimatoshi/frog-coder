@@ -11,7 +11,7 @@ import {
   existsSync,
   mkdirSync,
 } from "node:fs";
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, spawnSync, spawn } from "node:child_process";
 import { resolve, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
@@ -46,7 +46,13 @@ const CODE_ASSIST_HEADERS = {
 
 // ====== General Config ======
 const API_KEY = process.env.GEMINI_API_KEY || "";
-const MODEL = process.env.AGENT_MODEL || "gemini-2.5-flash";
+let MODEL = process.env.AGENT_MODEL || "gemini-2.5-flash";
+const AVAILABLE_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-pro",
+  "gemini-3-flash-preview",
+  "gemini-3.1-pro-preview",
+];
 const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
 const MAX_TOOL_LOOPS = 30;
 let CWD = process.cwd();
@@ -570,12 +576,29 @@ async function toolExecuteCommand({ command, timeout }) {
   }
 
   const ms = Math.min((timeout || 30) * 1000, 120000);
-  try {
-    const output = execSync(command, { encoding: "utf-8", timeout: ms, cwd: CWD, maxBuffer: 2 * 1024 * 1024, input: "\n", env: { ...process.env, CI: "true" } });
-    return { success: true, output: output.substring(0, 15000) };
-  } catch (e) {
-    return { success: false, exit_code: e.status, stdout: (e.stdout || "").substring(0, 8000), stderr: (e.stderr || "").substring(0, 8000) };
-  }
+  return new Promise((res) => {
+    let stdout = "", stderr = "";
+    const proc = spawn("sh", ["-c", command], {
+      cwd: CWD, env: { ...process.env, CI: "true" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    proc.stdin.write("\n");
+    proc.stdin.end();
+    proc.stdout.on("data", (d) => { stdout += d; if (stdout.length > 2 * 1024 * 1024) proc.kill(); });
+    proc.stderr.on("data", (d) => { stderr += d; if (stderr.length > 2 * 1024 * 1024) proc.kill(); });
+    const timer = setTimeout(() => proc.kill(), ms);
+    const onSigint = () => { proc.kill(); };
+    process.on("SIGINT", onSigint);
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      process.removeListener("SIGINT", onSigint);
+      if (code === 0) {
+        res({ success: true, output: stdout.substring(0, 15000) });
+      } else {
+        res({ success: false, exit_code: code, stdout: stdout.substring(0, 8000), stderr: stderr.substring(0, 8000) });
+      }
+    });
+  });
 }
 
 function toolFindFiles({ pattern, path }) {
@@ -681,7 +704,8 @@ function stopSpin() {
 }
 
 // ====== Rate Limit ======
-const MIN_INTERVAL = 60000; // 60s between calls (Code Assist actual limit: ~1 RPM)
+// Code Assist (OAuth): ~1 RPM, Standard API (API Key): ~15 RPM
+const MIN_INTERVAL = API_KEY ? 5000 : 60000;
 let lastApiCall = 0;
 
 function sleep(ms) {
@@ -1205,8 +1229,10 @@ Commands:
   /compact  履歴を圧縮（トークン節約）
   /history  履歴の状態を表示
   /safety   安全モード切替 (off/confirm/blocklist)
-  /model    現在のモデルを表示
+  /model    モデル切り替え (引数なしでサイクル、/model pro で部分一致)
   /help     このヘルプを表示
+  Enter×2   送信
+  Ctrl+D    送信（代替）
   Ctrl+C    終了
 \x1b[0m`);
 }
@@ -1324,15 +1350,16 @@ function readUserInput() {
             const chars = [...currentLine]; // Split by codepoints, not bytes
             chars.pop();
             lines[lines.length - 1] = chars.join("");
-            // Redraw current line from scratch to prevent display artifacts
-            const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
-            process.stdout.write("\r\x1b[K" + prefix + lines[lines.length - 1]);
           } else if (lines.length > 1) {
             lines.pop();
-            // Clear current (empty) line, move up, redraw previous line
-            const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
-            process.stdout.write("\r\x1b[K\x1b[A\r\x1b[K" + prefix + lines[lines.length - 1]);
+            // Move up one line
+            process.stdout.write("\x1b[A");
+          } else {
+            continue; // Nothing to delete
           }
+          // Redraw current line from scratch
+          const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
+          process.stdout.write(`\x1b[${1}G\x1b[2K` + prefix + lines[lines.length - 1]);
           continue;
         }
 
@@ -1382,7 +1409,7 @@ async function main() {
     console.log(`\x1b[31m認証なし. /login でGoogleアカウント認証してください\x1b[0m`);
   }
 
-  console.log(`\x1b[90mEnter=改行 Ctrl+D=送信 /help=コマンド一覧\x1b[0m\n`);
+  console.log(`\x1b[90mEnter=改行 Enter×2=送信 /help=コマンド一覧\x1b[0m\n`);
 
   while (true) {
     const input = (await readUserInput()).trim();
@@ -1413,7 +1440,25 @@ async function main() {
       console.log(`\x1b[90mMessages: ${history.length} | Tool calls: ${tc} | Turns: ${turnCount}\x1b[0m`);
       continue;
     }
-    if (input === "/model") { console.log(`\x1b[90m${MODEL}\x1b[0m`); continue; }
+    if (input.startsWith("/model")) {
+      const arg = input.split(/\s+/)[1];
+      if (arg) {
+        const match = AVAILABLE_MODELS.find(m => m.includes(arg));
+        if (match) {
+          MODEL = match;
+          console.log(`\x1b[90mModel: ${MODEL}\x1b[0m`);
+        } else {
+          console.log(`\x1b[31mUnknown model. Available:\x1b[0m`);
+          AVAILABLE_MODELS.forEach((m, i) => console.log(`\x1b[90m  ${i + 1}. ${m}${m === MODEL ? " (current)" : ""}\x1b[0m`));
+        }
+      } else {
+        // Cycle through models
+        const idx = AVAILABLE_MODELS.indexOf(MODEL);
+        MODEL = AVAILABLE_MODELS[(idx + 1) % AVAILABLE_MODELS.length];
+        console.log(`\x1b[90mModel: ${MODEL}\x1b[0m`);
+      }
+      continue;
+    }
     if (input.startsWith("/safety")) {
       const arg = input.split(/\s+/)[1];
       if (arg && ["off", "confirm", "blocklist"].includes(arg)) {
