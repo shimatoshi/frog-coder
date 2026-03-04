@@ -1298,8 +1298,16 @@ function readUserInput() {
           return;
         }
 
-        // Enter - newline
+        // Enter - newline, or send if previous line is empty (double Enter)
         if (byte === 13) {
+          if (lines.length > 0 && lines[lines.length - 1] === "") {
+            // Double Enter - send (remove trailing empty line)
+            lines.pop();
+            cleanup();
+            process.stdout.write("\n");
+            resolve(lines.join("\n"));
+            return;
+          }
           lines.push("");
           process.stdout.write("\n\x1b[90m│\x1b[0m ");
           continue;
