@@ -317,15 +317,16 @@ function isDangerous(command) {
 function confirmAction(message) {
   return new Promise((resolve) => {
     process.stdout.write(`\x1b[33m  ! ${message}\x1b[0m\n`);
-    process.stdout.write(`\x1b[33m  実行する？ (y/n): \x1b[0m`);
+    process.stdout.write(`\x1b[33m  実行する？ (Y/n): \x1b[0m`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.once("data", (data) => {
       process.stdin.setRawMode(false);
       process.stdin.pause();
-      const ch = data.toString().toLowerCase();
-      process.stdout.write(ch === "y" ? "y\n" : "n\n");
-      resolve(ch === "y");
+      const ch = data.toString();
+      const isYes = ch === "\r" || ch === "\n" || ch.toLowerCase() === "y";
+      process.stdout.write(isYes ? "y\n" : "n\n");
+      resolve(isYes);
     });
   });
 }
