@@ -18,9 +18,19 @@ import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 
+// ====== Load .env (zero-dep) ======
+try {
+  const envPath = join(dirname(new URL(import.meta.url).pathname), ".env");
+  if (existsSync(envPath)) {
+    for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+      const m = line.match(/^\s*([^#=]+?)\s*=\s*(.*?)\s*$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    }
+  }
+} catch {}
+
 // ====== OAuth Config (from Gemini CLI open source) ======
-const OAUTH_CLIENT_ID =
-  process.env.OAUTH_CLIENT_ID || "";
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_REDIRECT_URI = "http://localhost:8085/oauth2callback";
 const OAUTH_SCOPES = [
@@ -698,6 +708,7 @@ async function callGeminiOAuthStream(contents, _retried) {
   let fullText = "";
   const allParts = [];
   let streamingText = false;
+  let pendingSignature = null; // Buffer for thoughtSignature arriving before functionCall
 
   try {
     const reader = res.body.getReader();
@@ -732,9 +743,11 @@ async function callGeminiOAuthStream(contents, _retried) {
 
           for (const part of parts) {
             if (part.thought) {
-              // Keep thought parts with signatures for API compatibility
               allParts.push(part);
-            } else if (part.text) {
+            } else if (part.thoughtSignature && !part.functionCall && !part.text) {
+              // thoughtSignature alone in a separate chunk - buffer it
+              pendingSignature = part.thoughtSignature;
+            } else if (part.text && !part.thought) {
               if (!streamingText) {
                 stopSpin();
                 streamingText = true;
@@ -746,6 +759,11 @@ async function callGeminiOAuthStream(contents, _retried) {
               }
               fullText += part.text;
             } else if (part.functionCall) {
+              // Merge buffered thoughtSignature if the part doesn't already have one
+              if (pendingSignature && !part.thoughtSignature) {
+                part.thoughtSignature = pendingSignature;
+                pendingSignature = null;
+              }
               allParts.push(part);
             }
           }
@@ -883,11 +901,8 @@ async function callGemini(contents, retries = 3) {
   try {
     let result;
     if (isOAuthEnabled()) {
-      // Use non-streaming: preserves thought_signatures properly
-      // (streaming SSE strips thought_signatures from function call parts,
-      //  causing 400 errors on subsequent requests)
-      // Rate limit is 60 RPM regardless of streaming mode
-      result = await callGeminiOAuthNonStream(contents);
+      // Streaming: thoughtSignature is buffered and merged into functionCall parts
+      result = await callGeminiOAuthStream(contents);
     } else {
       result = await callGeminiApiKey(contents);
     }
