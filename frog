@@ -304,9 +304,9 @@ function isDangerous(command) {
   return DANGEROUS_PATTERNS.some(p => p.test(command));
 }
 
-function confirmExecution(command) {
+function confirmAction(message) {
   return new Promise((resolve) => {
-    process.stdout.write(`\x1b[33m  ! 確認: ${command}\x1b[0m\n`);
+    process.stdout.write(`\x1b[33m  ! ${message}\x1b[0m\n`);
     process.stdout.write(`\x1b[33m  実行する？ (y/n): \x1b[0m`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -489,9 +489,13 @@ function toolReadFile({ path }) {
   }
 }
 
-function toolWriteFile({ path, content }) {
+async function toolWriteFile({ path, content }) {
   try {
     const full = resolvePath(path);
+    if (safetyMode !== "off") {
+      const ok = await confirmAction(`書き込み: ${full} (${content.split("\n").length}行)`);
+      if (!ok) return { success: false, error: "User denied write" };
+    }
     const dir = dirname(full);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(full, content, "utf-8");
@@ -501,23 +505,27 @@ function toolWriteFile({ path, content }) {
   }
 }
 
-function toolWriteFiles({ files }) {
+async function toolWriteFiles({ files }) {
   const results = [];
   for (const f of files || []) {
-    results.push(toolWriteFile(f));
+    results.push(await toolWriteFile(f));
   }
   const ok = results.filter(r => r.success).length;
   const fail = results.filter(r => !r.success).length;
   return { success: fail === 0, wrote: ok, failed: fail, results };
 }
 
-function toolEditFile({ path, old_text, new_text }) {
+async function toolEditFile({ path, old_text, new_text }) {
   try {
     const full = resolvePath(path);
     const content = readFileSync(full, "utf-8");
     if (!content.includes(old_text)) return { success: false, error: "old_text not found in file" };
     const count = content.split(old_text).length - 1;
     if (count > 1) return { success: false, error: `old_text found ${count} times. Provide more context.` };
+    if (safetyMode !== "off") {
+      const ok = await confirmAction(`編集: ${full}`);
+      if (!ok) return { success: false, error: "User denied edit" };
+    }
     writeFileSync(full, content.replace(old_text, new_text), "utf-8");
     return { success: true, path: full };
   } catch (e) {
@@ -553,7 +561,7 @@ async function toolExecuteCommand({ command, timeout }) {
 
   // Safety check
   if (safetyMode === "confirm" || (safetyMode === "blocklist" && isDangerous(command))) {
-    const ok = await confirmExecution(command);
+    const ok = await confirmAction(`コマンド: ${command}`);
     if (!ok) return { success: false, error: "User denied execution" };
   }
 
@@ -1309,9 +1317,9 @@ function readUserInput() {
             process.stdout.write("\r\x1b[K" + prefix + lines[lines.length - 1]);
           } else if (lines.length > 1) {
             lines.pop();
-            // Move up, clear line, redraw previous line
+            // Clear current (empty) line, move up, redraw previous line
             const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
-            process.stdout.write("\x1b[A\r\x1b[K" + prefix + lines[lines.length - 1]);
+            process.stdout.write("\r\x1b[K\x1b[A\r\x1b[K" + prefix + lines[lines.length - 1]);
           }
           continue;
         }
