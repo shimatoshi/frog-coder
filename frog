@@ -38,11 +38,15 @@ const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/userinfo.profile",
 ];
 const CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-const CODE_ASSIST_HEADERS = {
-  "X-Goog-Api-Client": "gl-node/22.17.0",
-  "Client-Metadata":
-    "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
-};
+const CODE_ASSIST_HEADERS = (() => {
+  const arch = process.arch === "arm64" ? "ARM64" : "AMD64";
+  const plat = process.platform === "darwin" ? `DARWIN_${arch}`
+    : process.platform === "win32" ? `WINDOWS_${arch}` : `LINUX_${arch}`;
+  return {
+    "X-Goog-Api-Client": `gl-node/${process.versions.node} gccl-gemini-cli/1.0.0`,
+    "Client-Metadata": `ideType=GEMINI_CLI,platform=${plat},pluginType=GEMINI`,
+  };
+})();
 
 // ====== General Config ======
 const API_KEY = process.env.GEMINI_API_KEY || "";
@@ -54,7 +58,7 @@ const AVAILABLE_MODELS = [
   "gemini-3.1-pro-preview",
 ];
 const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
-const MAX_TOOL_LOOPS = 30;
+const MAX_TOOL_LOOPS = 15;
 let CWD = process.cwd();
 
 // ====== Auth Storage ======
@@ -704,8 +708,7 @@ function stopSpin() {
 }
 
 // ====== Rate Limit ======
-// No preemptive cooldown - just handle 429 retries when they come
-const MIN_INTERVAL = 0;
+const MIN_INTERVAL = 1500;
 let lastApiCall = 0;
 
 function sleep(ms) {
@@ -1012,48 +1015,50 @@ function isRateLimitError(e) {
   return e?.status === 429 || (e?.message && e.message.includes("429"));
 }
 
-async function callGemini(contents, retries = 3) {
+async function callGemini(contents, retries = 6, attempt = 0) {
   // Auto-compact if payload too large
   if (estimateSize(contents) > MAX_PAYLOAD_BYTES) {
     compactHistory();
   }
   await rateLimitWait();
-  lastApiCall = Date.now(); // Set BEFORE request so streaming + tool exec counts toward cooldown
+  lastApiCall = Date.now();
 
   try {
     let result;
     if (isOAuthEnabled()) {
-      // Streaming: thoughtSignature is buffered and merged into functionCall parts
       result = await callGeminiOAuthStream(contents);
     } else {
       result = await callGeminiApiKey(contents);
     }
     return result;
   } catch (e) {
-    // Handle rate limit with retry
+    // Handle rate limit with exponential backoff
     if (isRateLimitError(e)) {
       const errText = typeof e.text === "string" ? e.text : e.message || "";
       if (retries > 0) {
-        const waitSec = parseRetryDelay(errText) + 2;
+        const parsed = parseRetryDelay(errText);
+        const backoff = Math.min(2 ** attempt * 2, 120);
+        const jitter = Math.random() * 2;
+        const waitSec = Math.max(parsed, backoff) + jitter;
         stopSpin();
-        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${waitSec}s...\x1b[0m\n`);
-        startSpin(`retrying in ${waitSec}s...`);
+        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitSec)}s (attempt ${attempt + 1})...\x1b[0m\n`);
+        startSpin(`retrying in ${Math.ceil(waitSec)}s...`);
         await sleep(waitSec * 1000);
         lastApiCall = Date.now();
-        return callGemini(contents, retries - 1);
+        return callGemini(contents, retries - 1, attempt + 1);
       }
       throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
     }
 
-    // Handle network errors with retry
+    // Handle network errors with exponential backoff
     if (isNetworkError(e) && retries > 0) {
-      const waitSec = 5;
+      const waitSec = Math.min(2 ** attempt * 2, 30) + Math.random() * 2;
       stopSpin();
-      process.stdout.write(`\x1b[33m  ! network error: ${e.message}. retrying in ${waitSec}s...\x1b[0m\n`);
-      startSpin(`retrying in ${waitSec}s...`);
+      process.stdout.write(`\x1b[33m  ! network error: ${e.message}. retrying in ${Math.ceil(waitSec)}s...\x1b[0m\n`);
+      startSpin(`retrying in ${Math.ceil(waitSec)}s...`);
       await sleep(waitSec * 1000);
       lastApiCall = Date.now();
-      return callGemini(contents, retries - 1);
+      return callGemini(contents, retries - 1, attempt + 1);
     }
 
     throw e;
