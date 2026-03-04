@@ -970,7 +970,11 @@ async function agentTurn(userMessage) {
     const calls = parts.filter((p) => p.functionCall);
 
     if (calls.length === 0) {
-      return parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("");
+      // Streaming already printed text to stdout, only return for non-streaming (API key mode)
+      if (!isOAuthEnabled()) {
+        return parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("");
+      }
+      return "";
     }
 
     // Execute tool calls
@@ -1109,6 +1113,7 @@ function readUserInput() {
   return new Promise((resolve) => {
     process.stdout.write("\x1b[32m> \x1b[0m");
     const lines = [""];
+    let partialBytes = null; // Buffer for incomplete UTF-8 sequences
 
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -1120,6 +1125,12 @@ function readUserInput() {
     }
 
     function onData(data) {
+      // Prepend any leftover bytes from previous event
+      if (partialBytes) {
+        data = Buffer.concat([partialBytes, data]);
+        partialBytes = null;
+      }
+
       for (let i = 0; i < data.length; i++) {
         const byte = data[i];
 
@@ -1172,6 +1183,12 @@ function readUserInput() {
         else if (byte >= 0xe0 && byte < 0xf0) charBytes = 3;
         else if (byte >= 0xf0) charBytes = 4;
         else if (byte < 0x20) continue; // skip other control chars
+
+        // Not enough bytes yet - buffer for next data event
+        if (i + charBytes > data.length) {
+          partialBytes = data.slice(i);
+          break;
+        }
 
         const char = data.slice(i, i + charBytes).toString("utf-8");
         i += charBytes - 1;
