@@ -50,7 +50,7 @@ const CODE_ASSIST_HEADERS = (() => {
 
 // ====== General Config ======
 const API_KEY = process.env.GEMINI_API_KEY || "";
-let MODEL = process.env.AGENT_MODEL || "gemini-2.5-flash";
+let MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
 const AVAILABLE_MODELS = [
   "gemini-2.5-flash",
   "gemini-2.5-pro",
@@ -1404,7 +1404,8 @@ function readUserInput() {
   return new Promise((resolve) => {
     process.stdout.write("\x1b[32m> \x1b[0m");
     const lines = [""];
-    let partialBytes = null; // Buffer for incomplete UTF-8 sequences
+    let cursorPos = 0; // Character position within current line
+    let partialBytes = null;
 
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -1415,8 +1416,29 @@ function readUserInput() {
       process.stdin.pause();
     }
 
+    function getPrefix() {
+      return lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
+    }
+
+    function redrawLine() {
+      const prefix = getPrefix();
+      const text = lines[lines.length - 1];
+      const cols = process.stdout.columns || 80;
+      const prefixLen = prefix.replace(/\x1b\[[^m]*m/g, "").length;
+      const rendered = prefixLen + text.length;
+      const wrappedLines = Math.ceil(rendered / cols) || 1;
+      if (wrappedLines > 1) {
+        process.stdout.write(`\x1b[${wrappedLines - 1}A`);
+      }
+      process.stdout.write(`\r\x1b[J` + prefix + text);
+      // Move cursor back to correct position if not at end
+      const charsAfter = [...text].length - cursorPos;
+      if (charsAfter > 0) {
+        process.stdout.write(`\x1b[${charsAfter}D`);
+      }
+    }
+
     function onData(data) {
-      // Prepend any leftover bytes from previous event
       if (partialBytes) {
         data = Buffer.concat([partialBytes, data]);
         partialBytes = null;
@@ -1425,7 +1447,7 @@ function readUserInput() {
       for (let i = 0; i < data.length; i++) {
         const byte = data[i];
 
-        // Ctrl+C - exit
+        // Ctrl+C
         if (byte === 3) {
           cleanup();
           console.log("\n\x1b[90mBye.\x1b[0m");
@@ -1440,10 +1462,32 @@ function readUserInput() {
           return;
         }
 
-        // Enter - newline, or send if previous line is empty (double Enter)
+        // Ctrl+A - move to start of line
+        if (byte === 1) {
+          cursorPos = 0;
+          redrawLine();
+          continue;
+        }
+
+        // Ctrl+E - move to end of line
+        if (byte === 5) {
+          cursorPos = [...lines[lines.length - 1]].length;
+          redrawLine();
+          continue;
+        }
+
+        // Ctrl+U - delete from cursor to start of line
+        if (byte === 21) {
+          const chars = [...lines[lines.length - 1]];
+          lines[lines.length - 1] = chars.slice(cursorPos).join("");
+          cursorPos = 0;
+          redrawLine();
+          continue;
+        }
+
+        // Enter
         if (byte === 13) {
           if (lines.length > 0 && lines[lines.length - 1] === "") {
-            // Double Enter - send (remove trailing empty line)
             lines.pop();
             cleanup();
             process.stdout.write("\n");
@@ -1451,45 +1495,85 @@ function readUserInput() {
             return;
           }
           lines.push("");
+          cursorPos = 0;
           process.stdout.write("\n\x1b[90m│\x1b[0m ");
           continue;
         }
 
-        // Backspace - delete last character, redraw line to avoid ghost chars
+        // Backspace
         if (byte === 127 || byte === 8) {
-          const currentLine = lines[lines.length - 1];
-          if (currentLine.length > 0) {
-            const chars = [...currentLine]; // Split by codepoints, not bytes
-            chars.pop();
+          if (cursorPos > 0) {
+            const chars = [...lines[lines.length - 1]];
+            chars.splice(cursorPos - 1, 1);
             lines[lines.length - 1] = chars.join("");
+            cursorPos--;
+            redrawLine();
           } else if (lines.length > 1) {
             lines.pop();
-            // Clear current (empty) line, move up, then redraw previous line
+            const prevChars = [...lines[lines.length - 1]];
+            cursorPos = prevChars.length;
             process.stdout.write("\x1b[2K\x1b[A");
-          } else {
-            continue; // Nothing to delete
+            redrawLine();
           }
-          // Redraw: clear all wrapped lines by moving to column 1, clearing down,
-          // then writing the prefix + text
-          const prefix = lines.length > 1 ? "\x1b[90m│\x1b[0m " : "\x1b[32m> \x1b[0m";
-          const text = lines[lines.length - 1];
-          const cols = process.stdout.columns || 80;
-          const rendered = prefix.replace(/\x1b\[[^m]*m/g, "").length + text.length;
-          const wrappedLines = Math.ceil(rendered / cols) || 1;
-          // Move cursor up to the first wrapped line, then clear everything below
-          if (wrappedLines > 1) {
-            process.stdout.write(`\x1b[${wrappedLines - 1}A`);
-          }
-          process.stdout.write(`\r\x1b[J` + prefix + text);
           continue;
         }
 
-        // Escape sequences (arrow keys etc) - skip
+        // Delete key (Ctrl+D with content, or escape seq handled below)
+        // Escape sequences
         if (byte === 27) {
-          if (i + 1 < data.length && data[i + 1] === 91) {
+          if (i + 2 < data.length && data[i + 1] === 91) {
+            const code = data[i + 2];
+            // Arrow Left
+            if (code === 68) {
+              if (cursorPos > 0) {
+                cursorPos--;
+                process.stdout.write("\x1b[D");
+              }
+              i += 2;
+              continue;
+            }
+            // Arrow Right
+            if (code === 67) {
+              const chars = [...lines[lines.length - 1]];
+              if (cursorPos < chars.length) {
+                cursorPos++;
+                process.stdout.write("\x1b[C");
+              }
+              i += 2;
+              continue;
+            }
+            // Delete key: ESC [ 3 ~
+            if (code === 51 && i + 3 < data.length && data[i + 3] === 126) {
+              const chars = [...lines[lines.length - 1]];
+              if (cursorPos < chars.length) {
+                chars.splice(cursorPos, 1);
+                lines[lines.length - 1] = chars.join("");
+                redrawLine();
+              }
+              i += 3;
+              continue;
+            }
+            // Home: ESC [ H
+            if (code === 72) {
+              cursorPos = 0;
+              redrawLine();
+              i += 2;
+              continue;
+            }
+            // End: ESC [ F
+            if (code === 70) {
+              cursorPos = [...lines[lines.length - 1]].length;
+              redrawLine();
+              i += 2;
+              continue;
+            }
+            // Skip other escape sequences
             i += 2;
             while (i < data.length && data[i] < 64) i++;
+            continue;
           }
+          // Bare ESC or ESC + unknown
+          if (i + 1 < data.length) i++;
           continue;
         }
 
@@ -1498,9 +1582,8 @@ function readUserInput() {
         if (byte >= 0xc0 && byte < 0xe0) charBytes = 2;
         else if (byte >= 0xe0 && byte < 0xf0) charBytes = 3;
         else if (byte >= 0xf0) charBytes = 4;
-        else if (byte < 0x20) continue; // skip other control chars
+        else if (byte < 0x20) continue;
 
-        // Not enough bytes yet - buffer for next data event
         if (i + charBytes > data.length) {
           partialBytes = data.slice(i);
           break;
@@ -1508,8 +1591,19 @@ function readUserInput() {
 
         const char = data.slice(i, i + charBytes).toString("utf-8");
         i += charBytes - 1;
-        lines[lines.length - 1] += char;
-        process.stdout.write(char);
+
+        // Insert at cursor position
+        const chars = [...lines[lines.length - 1]];
+        chars.splice(cursorPos, 0, char);
+        lines[lines.length - 1] = chars.join("");
+        cursorPos++;
+
+        // Optimize: if at end, just write char; otherwise redraw
+        if (cursorPos === chars.length) {
+          process.stdout.write(char);
+        } else {
+          redrawLine();
+        }
       }
     }
 
