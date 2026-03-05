@@ -1113,6 +1113,7 @@ async function callGeminiOAuthStream(contents, _retried) {
     }
     const err = new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
     if (res.status === 429) { err.status = 429; err.text = errText; }
+    if (res.status === 404) { err.status = 404; }
     throw err;
   }
 
@@ -1236,6 +1237,7 @@ async function callGeminiOAuthNonStream(contents, _retried) {
     }
     const err = new Error(`CodeAssist API ${res.status}: ${errText.substring(0, 500)}`);
     if (res.status === 429) { err.status = 429; err.text = errText; }
+    if (res.status === 404) { err.status = 404; }
     throw err;
   }
 
@@ -1300,6 +1302,10 @@ function isNetworkError(e) {
 
 function isRateLimitError(e) {
   return e?.status === 429 || (e?.message && e.message.includes("429"));
+}
+
+function isModelNotFoundError(e) {
+  return e?.status === 404 || (e?.message && /404.*[Nn]ot [Ff]ound/.test(e.message));
 }
 
 let pendingRestore = null; // Model to restore on next successful call
@@ -1393,6 +1399,23 @@ async function callGemini(contents) {
         await sleep(waitMs);
         currentDelay = Math.min(MAX_DELAY, currentDelay * 2);
         continue;
+      }
+
+      // Model not found (404) → immediate fallback, no retry
+      if (isModelNotFoundError(e)) {
+        fallbackTried.add(MODEL);
+        const fallback = getModelFallback();
+        if (fallback) {
+          stopSpin();
+          process.stdout.write(`\x1b[33m  ! ${MODEL} not available (404). falling back to ${fallback}\x1b[0m\n`);
+          pendingRestore = pendingRestore || MODEL;
+          MODEL = fallback;
+          attempt = -1;
+          currentDelay = INITIAL_DELAY;
+          continue;
+        }
+        // No fallback available
+        throw new Error(`${MODEL} is not available and no fallback model found.`);
       }
 
       // Network errors with exponential backoff (cap 30s)
