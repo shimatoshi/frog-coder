@@ -50,6 +50,7 @@ let MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
 const AVAILABLE_MODELS = [
   "gemini-2.5-flash",
   "gemini-2.5-pro",
+  "gemini-3-pro-preview",
   "gemini-3-flash-preview",
   "gemini-3.1-pro-preview",
 ];
@@ -1022,9 +1023,10 @@ function isTerminalQuota(errText) {
 }
 
 const MODEL_FALLBACK_CHAIN = {
-  "gemini-3.1-pro-preview": ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
-  "gemini-3-flash-preview": ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
-  "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
+  "gemini-3.1-pro-preview": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-3-pro-preview": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-3-flash-preview": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
   "gemini-2.5-flash": [], // last resort, nowhere to fall
 };
 const FALLBACK_THRESHOLD_MS = 20000; // 20s: switch model instead of waiting
