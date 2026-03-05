@@ -737,27 +737,79 @@ async function rateLimitWait() {
   // so streaming time counts toward the cooldown
 }
 
+function parseDuration(duration) {
+  if (typeof duration !== "string") return null;
+  if (duration.endsWith("ms")) {
+    const ms = parseFloat(duration.slice(0, -2));
+    return isNaN(ms) ? null : ms / 1000;
+  }
+  if (duration.endsWith("s")) {
+    const sec = parseFloat(duration.slice(0, -1));
+    return isNaN(sec) ? null : sec;
+  }
+  return null;
+}
+
 function parseRetryDelay(errText) {
-  // Match "reset after 45s" format from Code Assist
-  const resetMatch = errText.match(/reset after (\d+)s/i);
-  if (resetMatch) return parseInt(resetMatch[1]);
-  // Match "retry in 30s" format
-  const retryMatch = errText.match(/retry in (\d+(?:\.\d+)?)s/i);
-  if (retryMatch) return Math.ceil(parseFloat(retryMatch[1]));
   try {
     const json = JSON.parse(errText);
-    // Check message field for "reset after Xs"
-    const msg = json.error?.message || "";
-    const msgMatch = msg.match(/reset after (\d+)s/i);
-    if (msgMatch) return parseInt(msgMatch[1]);
-    for (const d of json.error?.details || []) {
+    const details = json.error?.details || [];
+    // 1. Structured RetryInfo (protobuf style) - most reliable
+    for (const d of details) {
+      if (d["@type"]?.includes("RetryInfo") && d.retryDelay) {
+        const sec = parseDuration(d.retryDelay);
+        if (sec > 0) return sec;
+      }
+      // Fallback: plain retryDelay field
       if (d.retryDelay) {
-        const sec = parseInt(d.retryDelay);
+        const sec = parseDuration(d.retryDelay) ?? parseInt(d.retryDelay);
         if (sec > 0) return sec;
       }
     }
+    // 2. "Please retry in Xs" in message (Google API common format)
+    const msg = json.error?.message || "";
+    const pleaseRetry = msg.match(/(?:Please )?retry in ([0-9.]+(?:ms|s))/i);
+    if (pleaseRetry) {
+      const sec = parseDuration(pleaseRetry[1]);
+      if (sec > 0) return sec;
+    }
+    // 3. "reset after Xs" format from Code Assist
+    const resetMatch = msg.match(/reset after (\d+)s/i);
+    if (resetMatch) return parseInt(resetMatch[1]);
   } catch {}
-  return 60;
+  // 4. Regex fallback on raw text
+  const resetMatch = errText.match(/reset after (\d+)s/i);
+  if (resetMatch) return parseInt(resetMatch[1]);
+  const retryMatch = errText.match(/retry in ([0-9.]+(?:ms|s))/i);
+  if (retryMatch) {
+    const sec = parseDuration(retryMatch[1]);
+    if (sec > 0) return sec;
+  }
+  return 0; // 0 = no server delay found (use client backoff)
+}
+
+function isTerminalQuota(errText) {
+  try {
+    const json = JSON.parse(errText);
+    const details = json.error?.details || [];
+    for (const d of details) {
+      // Daily quota exhausted
+      if (d.violations) {
+        for (const v of d.violations) {
+          if (v.quotaId?.includes("PerDay") || v.quotaId?.includes("Daily")) return true;
+        }
+      }
+      // ErrorInfo: QUOTA_EXHAUSTED from Cloud Code
+      if (d.reason === "QUOTA_EXHAUSTED" || d.reason === "INSUFFICIENT_G1_CREDITS_BALANCE") return true;
+    }
+  } catch {}
+  return false;
+}
+
+function getFlashFallback() {
+  // Find a flash model different from current
+  const flash = AVAILABLE_MODELS.find(m => m.includes("flash") && m !== MODEL);
+  return flash || null;
 }
 
 // ====== Gemini API ======
@@ -1016,52 +1068,104 @@ function isRateLimitError(e) {
   return e?.status === 429 || (e?.message && e.message.includes("429"));
 }
 
-async function callGemini(contents, retries = 6, attempt = 0) {
+async function callGemini(contents) {
   // Auto-compact if payload too large
   if (estimateSize(contents) > MAX_PAYLOAD_BYTES) {
     compactHistory();
   }
   await rateLimitWait();
 
-  try {
-    let result;
-    if (isOAuthEnabled()) {
-      result = await callGeminiOAuthStream(contents);
-    } else {
-      result = await callGeminiApiKey(contents);
-    }
-    lastApiCall = Date.now(); // Set AFTER response so tool execution time counts toward cooldown
-    return result;
-  } catch (e) {
-    // Handle rate limit with exponential backoff
-    if (isRateLimitError(e)) {
-      const errText = typeof e.text === "string" ? e.text : e.message || "";
-      if (retries > 0) {
-        const parsed = parseRetryDelay(errText);
-        const backoff = Math.min(2 ** attempt * 2, 120);
-        const jitter = Math.random() * 2;
-        const waitSec = Math.max(parsed, backoff) + jitter;
-        stopSpin();
-        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitSec)}s (attempt ${attempt + 1})...\x1b[0m\n`);
-        startSpin(`retrying in ${Math.ceil(waitSec)}s...`);
-        await sleep(waitSec * 1000);
-        return callGemini(contents, retries - 1, attempt + 1);
+  const MAX_ATTEMPTS = 10;
+  const INITIAL_DELAY = 5000;  // 5s (matches Gemini CLI)
+  const MAX_DELAY = 30000;     // 30s cap (matches Gemini CLI)
+  const QUICK_RETRIES = 3;     // Layer 1: fast retries at 150ms
+  const QUICK_DELAY = 150;
+
+  let currentDelay = INITIAL_DELAY;
+  let savedModel = MODEL; // For fallback recovery
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      let result;
+      if (isOAuthEnabled()) {
+        result = await callGeminiOAuthStream(contents);
+      } else {
+        result = await callGeminiApiKey(contents);
       }
-      throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
-    }
+      lastApiCall = Date.now();
+      // Restore model if we fell back
+      if (MODEL !== savedModel) {
+        process.stdout.write(`\x1b[90m  (restoring model: ${savedModel})\x1b[0m\n`);
+        MODEL = savedModel;
+      }
+      return result;
+    } catch (e) {
+      if (isRateLimitError(e)) {
+        const errText = typeof e.text === "string" ? e.text : e.message || "";
 
-    // Handle network errors with exponential backoff
-    if (isNetworkError(e) && retries > 0) {
-      const waitSec = Math.min(2 ** attempt * 2, 30) + Math.random() * 2;
-      stopSpin();
-      process.stdout.write(`\x1b[33m  ! network error: ${e.message}. retrying in ${Math.ceil(waitSec)}s...\x1b[0m\n`);
-      startSpin(`retrying in ${Math.ceil(waitSec)}s...`);
-      await sleep(waitSec * 1000);
-      return callGemini(contents, retries - 1, attempt + 1);
-    }
+        // Terminal quota (daily limit) → try flash fallback
+        if (isTerminalQuota(errText)) {
+          const flash = getFlashFallback();
+          if (flash && MODEL !== flash) {
+            stopSpin();
+            process.stdout.write(`\x1b[33m  ! daily quota reached on ${MODEL}. falling back to ${flash}\x1b[0m\n`);
+            savedModel = MODEL;
+            MODEL = flash;
+            attempt = -1; // Reset attempts
+            currentDelay = INITIAL_DELAY;
+            continue;
+          }
+          throw new Error(`日次クォータ超過 (${MODEL}). しばらく待ってから再試行してください。`);
+        }
 
-    throw e;
+        if (attempt >= MAX_ATTEMPTS - 1) {
+          throw new Error(`Rate limit exceeded. しばらく待ってから再試行してください。`);
+        }
+
+        // Layer 1: Quick retries for transient 429s (like google-auth-library transport)
+        if (attempt < QUICK_RETRIES) {
+          await sleep(QUICK_DELAY);
+          continue;
+        }
+
+        // Layer 2: Exponential backoff with server delay respect
+        const serverDelay = parseRetryDelay(errText);
+        let waitMs;
+        if (serverDelay > 0) {
+          // Server told us how long - trust it, add small jitter
+          waitMs = serverDelay * 1000 + currentDelay * 0.2 * Math.random();
+          currentDelay = Math.max(currentDelay, serverDelay * 1000);
+        } else {
+          // No server hint - use exponential backoff with ±30% jitter
+          const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
+          waitMs = Math.max(0, currentDelay + jitter);
+        }
+
+        stopSpin();
+        process.stdout.write(`\x1b[33m  ! rate limit. waiting ${Math.ceil(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})...\x1b[0m\n`);
+        startSpin(`retrying in ${Math.ceil(waitMs / 1000)}s...`);
+        await sleep(waitMs);
+        currentDelay = Math.min(MAX_DELAY, currentDelay * 2);
+        continue;
+      }
+
+      // Network errors with exponential backoff (cap 30s)
+      if (isNetworkError(e) && attempt < MAX_ATTEMPTS - 1) {
+        const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
+        const waitMs = Math.max(0, currentDelay + jitter);
+        stopSpin();
+        process.stdout.write(`\x1b[33m  ! network error: ${e.message}. retrying in ${Math.ceil(waitMs / 1000)}s...\x1b[0m\n`);
+        startSpin(`retrying in ${Math.ceil(waitMs / 1000)}s...`);
+        await sleep(waitMs);
+        currentDelay = Math.min(MAX_DELAY, currentDelay * 2);
+        continue;
+      }
+
+      throw e;
+    }
   }
+
+  throw new Error("Retry attempts exhausted");
 }
 
 // ====== Format tool args ======
