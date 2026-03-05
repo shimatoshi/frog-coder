@@ -354,7 +354,8 @@ Rules:
 - Be concise. Under 3 lines of text output unless explaining complex changes.
 - Respond in the same language the user uses
 - NEVER run interactive commands. Use non-interactive flags (-y, --yes, -m, etc.)
-- Do NOT explore aimlessly. If you cannot find something in 2-3 searches, ask the user.`;
+- Do NOT explore aimlessly. If you cannot find something in 2-3 searches, ask the user.`
++ (sessionStartContext ? `\n\n${sessionStartContext}` : "");
 
 // ====== Tool Definitions ======
 const tools = [
@@ -798,13 +799,24 @@ const TOOL_MAP = {
 };
 
 // ====== Hooks System (japanese-developer compatible) ======
-const HOOKS_FILE = join(homedir(), ".frog", "hooks.json");
+const GEMINI_SETTINGS_FILE = join(homedir(), ".gemini", "settings.json");
+const FROG_HOOKS_FILE = join(homedir(), ".frog", "hooks.json");
 let hooksConfig = null;
 
 function loadHooks() {
+  // Priority: ~/.gemini/settings.json (jdev standard) > ~/.frog/hooks.json (frog local)
   try {
-    if (existsSync(HOOKS_FILE)) {
-      hooksConfig = JSON.parse(readFileSync(HOOKS_FILE, "utf-8"));
+    if (existsSync(GEMINI_SETTINGS_FILE)) {
+      const settings = JSON.parse(readFileSync(GEMINI_SETTINGS_FILE, "utf-8"));
+      if (settings.hooks && Object.keys(settings.hooks).length > 0) {
+        hooksConfig = settings.hooks;
+        return;
+      }
+    }
+  } catch {}
+  try {
+    if (existsSync(FROG_HOOKS_FILE)) {
+      hooksConfig = JSON.parse(readFileSync(FROG_HOOKS_FILE, "utf-8"));
     }
   } catch {}
 }
@@ -816,13 +828,17 @@ function matchesHook(matcher, toolName) {
 async function runHooks(phase, toolName, input) {
   if (!hooksConfig?.[phase]) return null;
 
+  const results = [];
   for (const group of hooksConfig[phase]) {
     if (group.matcher && !matchesHook(group.matcher, toolName)) continue;
     for (const hook of group.hooks || []) {
       if (hook.type !== "command") continue;
       try {
         const timeout = hook.timeout || 5000;
-        const payload = JSON.stringify({ tool_name: toolName, tool_input: input });
+        // jdev protocol: { tool_name, tool_input, tool_response? }
+        const payload = JSON.stringify(
+          input?._raw ? input._raw : { tool_name: toolName, tool_input: input }
+        );
         const result = spawnSync("bash", ["-c", hook.command], {
           input: payload,
           encoding: "utf-8",
@@ -835,10 +851,29 @@ async function runHooks(phase, toolName, input) {
         if (parsed.decision === "deny") {
           return { denied: true, reason: parsed.reason || "Blocked by hook" };
         }
+        // Collect hook outputs (additionalContext, systemMessage)
+        if (parsed.hookSpecificOutput || parsed.systemMessage) {
+          results.push(parsed);
+        }
       } catch {}
     }
   }
-  return null;
+  return results.length > 0 ? { outputs: results } : null;
+}
+
+// SessionStart hook context (injected into system prompt)
+let sessionStartContext = "";
+
+async function runSessionStartHooks() {
+  const result = await runHooks("SessionStart", null, {});
+  if (result?.outputs) {
+    const contexts = result.outputs
+      .map(o => o.hookSpecificOutput?.additionalContext)
+      .filter(Boolean);
+    if (contexts.length > 0) {
+      sessionStartContext = contexts.join("\n");
+    }
+  }
 }
 
 loadHooks();
@@ -1487,8 +1522,20 @@ async function agentTurn(userMessage) {
         process.stdout.write(`\x1b[31m    x ${result.error || "failed"}\x1b[0m\n`);
       }
 
-      // AfterTool hooks
-      await runHooks("AfterTool", name, { input: args || {}, result });
+      // AfterTool hooks (pass full jdev-compatible payload)
+      const afterResult = await runHooks("AfterTool", name, {
+        _raw: { tool_name: name, tool_input: args || {}, tool_response: result },
+      });
+      if (afterResult?.outputs) {
+        for (const out of afterResult.outputs) {
+          const msg = out.systemMessage || out.hookSpecificOutput?.additionalContext;
+          if (msg) {
+            process.stdout.write(`\x1b[33m    hook: ${msg}\x1b[0m\n`);
+            // Inject hook feedback as part of tool response so the model sees it
+            result._hookFeedback = (result._hookFeedback || "") + msg + "\n";
+          }
+        }
+      }
 
       responses.push({ functionResponse: { name, response: result } });
     }
@@ -1872,6 +1919,12 @@ async function main() {
   }
 
   console.log(`\x1b[90mEnter=改行 Enter×2=送信 /help=コマンド一覧\x1b[0m\n`);
+
+  // Run SessionStart hooks (jdev: enforce-japanese, primer, etc.)
+  await runSessionStartHooks();
+  if (sessionStartContext) {
+    process.stdout.write(`\x1b[90m  hooks: SessionStart context loaded\x1b[0m\n`);
+  }
 
   while (true) {
     const input = (await readUserInput()).trim();
