@@ -845,16 +845,21 @@ function isTerminalQuota(errText) {
   return false;
 }
 
-const MODEL_FALLBACK = {
-  "gemini-3.1-pro-preview": "gemini-3-flash-preview",
-  "gemini-3-flash-preview": "gemini-2.5-flash",
-  "gemini-2.5-pro": "gemini-2.5-flash",
-  "gemini-2.5-flash": null, // nowhere to fall
+const MODEL_FALLBACK_CHAIN = {
+  "gemini-3.1-pro-preview": ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-3-flash-preview": ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
+  "gemini-2.5-flash": [], // last resort, nowhere to fall
 };
 const FALLBACK_THRESHOLD_MS = 20000; // 20s: switch model instead of waiting
+let fallbackTried = new Set(); // track which models failed in current retry cycle
 
 function getModelFallback() {
-  return MODEL_FALLBACK[MODEL] || null;
+  const chain = MODEL_FALLBACK_CHAIN[MODEL] || [];
+  for (const candidate of chain) {
+    if (!fallbackTried.has(candidate)) return candidate;
+  }
+  return null; // all tried
 }
 
 function getFlashFallback() {
@@ -1132,10 +1137,10 @@ async function callGemini(contents) {
 
   // Try restoring original model if we fell back previously
   if (pendingRestore && MODEL !== pendingRestore) {
-    const restoreFrom = MODEL;
     MODEL = pendingRestore;
     process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL})\x1b[0m\n`);
     pendingRestore = null;
+    fallbackTried.clear();
     // If restore fails with 429, we'll fall back again below
   }
 
@@ -1154,6 +1159,7 @@ async function callGemini(contents) {
         result = await callGeminiApiKey(contents);
       }
       lastApiCall = Date.now();
+      fallbackTried.clear();
       return result;
     } catch (e) {
       if (isRateLimitError(e)) {
@@ -1194,9 +1200,10 @@ async function callGemini(contents) {
 
         // Auto-fallback: if wait > 20s, switch model instead of waiting
         if (waitMs > FALLBACK_THRESHOLD_MS) {
+          fallbackTried.add(MODEL);
           const fallback = getModelFallback();
           if (fallback) {
-            process.stdout.write(`\x1b[33m  ! wait ${Math.ceil(waitMs / 1000)}s > ${FALLBACK_THRESHOLD_MS / 1000}s threshold. switching ${MODEL} → ${fallback}\x1b[0m\n`);
+            process.stdout.write(`\x1b[33m  ! wait ${Math.ceil(waitMs / 1000)}s > ${FALLBACK_THRESHOLD_MS / 1000}s. ${MODEL} → ${fallback}\x1b[0m\n`);
             pendingRestore = pendingRestore || MODEL; // remember original
             MODEL = fallback;
             attempt = -1;
