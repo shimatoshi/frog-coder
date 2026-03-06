@@ -1333,6 +1333,8 @@ function isModelNotFoundError(e) {
 }
 
 let pendingRestore = null; // Model to restore on next successful call
+let dailyQuotaHitAt = null; // Timestamp when daily quota was hit
+const DAILY_QUOTA_COOLDOWN = 60 * 60 * 1000; // 1 hour before retrying quota-exhausted model
 
 async function callGemini(contents) {
   // Auto-compact if payload too large
@@ -1343,13 +1345,19 @@ async function callGemini(contents) {
 
   // Try restoring original model if we fell back previously
   if (pendingRestore && MODEL !== pendingRestore) {
-    MODEL = pendingRestore;
-    process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL})\x1b[0m\n`);
-    pendingRestore = null;
-    fallbackTried.clear();
-    // Strip thought/thoughtSignature from history - different models reject foreign signatures
-    stripThoughtSignatures();
-    // If restore fails with 429, we'll fall back again below
+    // If we hit daily quota, don't retry until cooldown expires
+    if (dailyQuotaHitAt && (Date.now() - dailyQuotaHitAt) < DAILY_QUOTA_COOLDOWN) {
+      // Skip restore attempt - still in cooldown
+    } else {
+      MODEL = pendingRestore;
+      process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL})\x1b[0m\n`);
+      pendingRestore = null;
+      dailyQuotaHitAt = null;
+      fallbackTried.clear();
+      // Strip thought/thoughtSignature from history - different models reject foreign signatures
+      stripThoughtSignatures();
+      // If restore fails with 429, we'll fall back again below
+    }
   }
 
   const MAX_ATTEMPTS = 7;
@@ -1380,6 +1388,7 @@ async function callGemini(contents) {
             stopSpin();
             process.stdout.write(`\x1b[33m  ! daily quota reached on ${MODEL}. falling back to ${flash}\x1b[0m\n`);
             pendingRestore = MODEL;
+            dailyQuotaHitAt = Date.now();
             MODEL = flash;
             stripThoughtSignatures();
             attempt = -1; // Reset attempts
