@@ -2,7 +2,7 @@
 // ============================================
 // frog - coding agent for Termux
 // Zero dependencies. Multi-provider support.
-// Gemini (OAuth/API key) + xAI Grok + more.
+// Zero dependencies. Gemini OAuth + API key.
 // ============================================
 
 import {
@@ -60,43 +60,15 @@ function frogLog(tool, detail) {
 
 // ====== General Config ======
 const API_KEY = process.env.GEMINI_API_KEY || "";
-const XAI_API_KEY = process.env.XAI_API_KEY || "";
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || "";
 let MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
 
-// ====== Provider Registry ======
-// Each model maps to a provider with its API details.
-// Internal history format is always Gemini-style; conversion happens at call time.
-const PROVIDER_MODELS = {
-  // Gemini models (native format)
-  "gemini-2.5-flash":       { provider: "gemini" },
-  "gemini-2.5-pro":         { provider: "gemini" },
-  "gemini-3-pro-preview":   { provider: "gemini" },
-  "gemini-3-flash-preview": { provider: "gemini" },
-  "gemini-3.1-pro-preview": { provider: "gemini" },
-  // xAI Grok models (OpenAI-compatible)
-  "grok-code-fast-1":       { provider: "xai", apiBase: "https://api.x.ai/v1", apiKey: () => XAI_API_KEY },
-  // MiniMax models (OpenAI-compatible)
-  "MiniMax-M2.5-highspeed": { provider: "minimax", apiBase: "https://api.minimax.io/v1", apiKey: () => MINIMAX_API_KEY },
-  "MiniMax-M2.5":           { provider: "minimax", apiBase: "https://api.minimax.io/v1", apiKey: () => MINIMAX_API_KEY },
-};
-
-// Build AVAILABLE_MODELS dynamically: Gemini always, others if API key is set
-function getAvailableModels() {
-  const models = Object.keys(PROVIDER_MODELS).filter(m => {
-    const p = PROVIDER_MODELS[m];
-    if (p.provider === "gemini") return true;
-    if (p.provider === "xai") return !!XAI_API_KEY;
-    if (p.provider === "minimax") return !!MINIMAX_API_KEY;
-    return false;
-  });
-  return models;
-}
-const AVAILABLE_MODELS = getAvailableModels();
-
-function getProvider(model) {
-  return PROVIDER_MODELS[model]?.provider || "gemini";
-}
+const AVAILABLE_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-pro",
+  "gemini-3-pro-preview",
+  "gemini-3-flash-preview",
+  "gemini-3.1-pro-preview",
+];
 
 const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
 const MAX_TOOL_LOOPS = 30;
@@ -752,37 +724,8 @@ Rules:
     let response;
     try {
       await rateLimitWait();
-      const provider = getProvider(MODEL);
 
-      if (provider !== "gemini") {
-        // OpenAI-compatible: convert sub-agent history and tools
-        const providerInfo = PROVIDER_MODELS[MODEL];
-        const apiKey = typeof providerInfo.apiKey === "function" ? providerInfo.apiKey() : providerInfo.apiKey;
-        const openAIMessages = geminiHistoryToOpenAI(subHistory, subSystemPrompt);
-        const openAITools = geminiToolsToOpenAI(SUB_AGENT_TOOLS);
-        const res = await fetchWithTimeout(
-          `${providerInfo.apiBase}/chat/completions`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-            body: JSON.stringify({ model: MODEL, messages: openAIMessages, tools: openAITools, temperature: 0.2 }),
-          },
-          90000
-        );
-        if (!res.ok) {
-          const errText = await res.text();
-          if (res.status === 429) {
-            const waitMs = 5000;
-            process.stdout.write(`\x1b[90m    sub-agent 429, waiting ${Math.ceil(waitMs / 1000)}s...\x1b[0m\n`);
-            await sleep(waitMs);
-            continue;
-          }
-          return { success: false, error: `API ${res.status}: ${errText.substring(0, 200)}` };
-        }
-        const data = await res.json();
-        response = openAIResponseToGemini(data);
-      } else {
-        // Gemini native
+      {
         const valid = await ensureValidToken();
         if (!valid) return { success: false, error: "OAuth token invalid" };
         await initProject();
@@ -1123,23 +1066,13 @@ function isTerminalQuota(errText) {
   return false;
 }
 
-// Fallback chain is built dynamically based on available API keys.
-// Order: Gemini models by quality → Grok (if XAI_API_KEY set) → 2.5 Flash (last resort)
-function buildFallbackChain() {
-  const geminiChain = ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"];
-  const grokModels = XAI_API_KEY ? ["grok-code-fast-1"] : [];
-  const minimaxModels = MINIMAX_API_KEY ? ["MiniMax-M2.5-highspeed", "MiniMax-M2.5"] : [];
-  const lastResort = ["gemini-2.5-flash"];
-
-  const chain = {};
-  for (const model of Object.keys(PROVIDER_MODELS)) {
-    if (!AVAILABLE_MODELS.includes(model)) continue;
-    const full = [...geminiChain, ...grokModels, ...minimaxModels, ...lastResort].filter(m => m !== model && AVAILABLE_MODELS.includes(m));
-    chain[model] = full;
-  }
-  return chain;
-}
-const MODEL_FALLBACK_CHAIN = buildFallbackChain();
+const MODEL_FALLBACK_CHAIN = {
+  "gemini-3.1-pro-preview": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-3-pro-preview": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-3-flash-preview": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+  "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
+  "gemini-2.5-flash": [], // last resort, nowhere to fall
+};
 let fallbackTried = new Set(); // track which models failed in current retry cycle
 
 function getModelFallback() {
@@ -1401,180 +1334,6 @@ async function callGeminiApiKey(contents) {
   throw new Error("Unexpected response: " + JSON.stringify(data).substring(0, 300));
 }
 
-// ====== OpenAI-Compatible API (Grok, DeepSeek, MiniMax, etc.) ======
-// Converts between Gemini internal format and OpenAI chat completion format.
-
-function geminiToolsToOpenAI(geminiTools) {
-  const result = [];
-  for (const toolGroup of geminiTools) {
-    for (const decl of toolGroup.functionDeclarations || []) {
-      result.push({
-        type: "function",
-        function: {
-          name: decl.name,
-          description: decl.description || "",
-          parameters: convertSchemaToOpenAI(decl.parameters),
-        },
-      });
-    }
-  }
-  return result;
-}
-
-function convertSchemaToOpenAI(schema) {
-  if (!schema) return {};
-  const result = {};
-  if (schema.type) result.type = schema.type.toLowerCase();
-  if (schema.description) result.description = schema.description;
-  if (schema.required) result.required = schema.required;
-  if (schema.properties) {
-    result.properties = {};
-    for (const [key, val] of Object.entries(schema.properties)) {
-      result.properties[key] = convertSchemaToOpenAI(val);
-    }
-  }
-  if (schema.items) result.items = convertSchemaToOpenAI(schema.items);
-  return result;
-}
-
-function geminiHistoryToOpenAI(contents, systemPrompt) {
-  const messages = [];
-  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
-
-  // Track tool_call IDs: OpenAI requires tool responses to reference a tool_call_id.
-  // We generate stable IDs from the function name + position.
-  let toolCallCounter = 0;
-  const pendingToolCallIds = []; // stack of [{name, id}]
-
-  for (const msg of contents) {
-    if (msg.role === "user") {
-      const textParts = [];
-      const toolResponses = [];
-
-      for (const part of msg.parts || []) {
-        if (part.text) {
-          textParts.push(part.text);
-        } else if (part.functionResponse) {
-          // Find matching tool_call_id
-          const id = pendingToolCallIds.shift()?.id || `call_${toolCallCounter++}`;
-          const content = typeof part.functionResponse.response === "string"
-            ? part.functionResponse.response
-            : JSON.stringify(part.functionResponse.response);
-          toolResponses.push({ role: "tool", tool_call_id: id, content });
-        }
-      }
-
-      if (textParts.length > 0) messages.push({ role: "user", content: textParts.join("\n") });
-      for (const tr of toolResponses) messages.push(tr);
-
-    } else if (msg.role === "model") {
-      const textParts = [];
-      const toolCalls = [];
-
-      for (const part of msg.parts || []) {
-        if (part.thought) continue; // skip thinking parts
-        if (part.text) {
-          textParts.push(part.text);
-        } else if (part.functionCall) {
-          const id = `call_${toolCallCounter++}`;
-          toolCalls.push({
-            id,
-            type: "function",
-            function: {
-              name: part.functionCall.name,
-              arguments: JSON.stringify(part.functionCall.args || {}),
-            },
-          });
-          pendingToolCallIds.push({ name: part.functionCall.name, id });
-        }
-      }
-
-      const assistantMsg = { role: "assistant" };
-      if (textParts.length > 0) assistantMsg.content = textParts.join("\n");
-      else assistantMsg.content = null;
-      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-      messages.push(assistantMsg);
-    }
-  }
-
-  return messages;
-}
-
-function openAIResponseToGemini(data) {
-  const choice = data.choices?.[0];
-  if (!choice?.message) {
-    throw new Error("Unexpected OpenAI response: " + JSON.stringify(data).substring(0, 300));
-  }
-
-  const msg = choice.message;
-  const parts = [];
-
-  if (msg.content) parts.push({ text: msg.content });
-
-  if (msg.tool_calls) {
-    for (const tc of msg.tool_calls) {
-      if (tc.type === "function") {
-        let args = {};
-        try { args = JSON.parse(tc.function.arguments); } catch {}
-        parts.push({ functionCall: { name: tc.function.name, args } });
-      }
-    }
-  }
-
-  if (parts.length === 0) parts.push({ text: "[Empty response]" });
-  return { role: "model", parts };
-}
-
-async function callOpenAICompatible(contents) {
-  const providerInfo = PROVIDER_MODELS[MODEL];
-  if (!providerInfo) throw new Error(`Unknown model: ${MODEL}`);
-
-  const apiKey = typeof providerInfo.apiKey === "function" ? providerInfo.apiKey() : providerInfo.apiKey;
-  if (!apiKey) throw new Error(`API key not set for ${MODEL}. Set the appropriate env var.`);
-
-  const apiBase = providerInfo.apiBase;
-  const openAIMessages = geminiHistoryToOpenAI(contents, getSystemPrompt());
-  const openAITools = geminiToolsToOpenAI(tools);
-
-  const body = {
-    model: MODEL,
-    messages: openAIMessages,
-    tools: openAITools,
-    temperature: 0.2,
-  };
-
-  const res = await fetchWithTimeout(
-    `${apiBase}/chat/completions`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-    },
-    90000
-  );
-
-  if (!res.ok) {
-    const errText = await res.text();
-    if (res.status === 429) {
-      const err = new Error(`${providerInfo.provider} API 429: ${errText.substring(0, 300)}`);
-      err.status = 429;
-      err.text = errText;
-      throw err;
-    }
-    if (res.status === 404) {
-      const err = new Error(`${MODEL} not found (404)`);
-      err.status = 404;
-      throw err;
-    }
-    throw new Error(`${providerInfo.provider} API ${res.status}: ${errText.substring(0, 300)}`);
-  }
-
-  const data = await res.json();
-  return openAIResponseToGemini(data);
-}
 
 function isNetworkError(e) {
   const msg = e?.message || "";
@@ -1635,11 +1394,7 @@ async function callGemini(contents) {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       let result;
-      const provider = getProvider(MODEL);
-      if (provider !== "gemini") {
-        // OpenAI-compatible providers (xAI Grok, etc.)
-        result = await callOpenAICompatible(contents);
-      } else if (isOAuthEnabled()) {
+      if (isOAuthEnabled()) {
         result = await callGeminiOAuthStream(contents);
       } else {
         result = await callGeminiApiKey(contents);
@@ -2036,16 +1791,7 @@ function showStatus() {
     console.log(`\x1b[31mNot authenticated\x1b[0m`);
     console.log(`\x1b[90m/login でGoogleアカウント認証してください\x1b[0m`);
   }
-  // Show external provider status
-  if (XAI_API_KEY) {
-    console.log(`\x1b[32mxAI Grok: Active\x1b[0m`);
-    console.log(`\x1b[90mModels: ${Object.keys(PROVIDER_MODELS).filter(m => PROVIDER_MODELS[m].provider === "xai").join(", ")}\x1b[0m`);
-  }
-  if (MINIMAX_API_KEY) {
-    console.log(`\x1b[32mMiniMax: Active\x1b[0m`);
-    console.log(`\x1b[90mModels: ${Object.keys(PROVIDER_MODELS).filter(m => PROVIDER_MODELS[m].provider === "minimax").join(", ")}\x1b[0m`);
-  }
-  console.log(`\x1b[90mCurrent model: ${MODEL} (${getProvider(MODEL)})\x1b[0m`);
+  console.log(`\x1b[90mCurrent model: ${MODEL}\x1b[0m`);
 }
 
 // ====== Character Width ======
@@ -2320,7 +2066,7 @@ function readUserInput() {
 // ====== Main ======
 async function main() {
   console.log(`\x1b[36m🐸 frog v0.5\x1b[0m`);
-  console.log(`\x1b[90mModel: ${MODEL} (${getProvider(MODEL)}) | Dir: ${CWD}\x1b[0m`);
+  console.log(`\x1b[90mModel: ${MODEL} | Dir: ${CWD}\x1b[0m`);
 
   if (isOAuthEnabled()) {
     console.log(`\x1b[32mOAuth: ${authTokens.email || "authenticated"}\x1b[0m`);
@@ -2328,12 +2074,6 @@ async function main() {
     console.log(`\x1b[33mAPI Key mode (制限あり). /login でOAuth認証推奨\x1b[0m`);
   } else {
     console.log(`\x1b[31m認証なし. /login でGoogleアカウント認証してください\x1b[0m`);
-  }
-  // Show external providers
-  const externalProviders = [];
-  if (XAI_API_KEY) externalProviders.push("xAI Grok");
-  if (externalProviders.length > 0) {
-    console.log(`\x1b[90mExternal: ${externalProviders.join(", ")}\x1b[0m`);
   }
 
   console.log(`\x1b[90mEnter=改行 Enter×2=送信 /help=コマンド一覧\x1b[0m\n`);
