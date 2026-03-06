@@ -63,10 +63,11 @@ let API_KEY = process.env.GEMINI_API_KEY || "";
 let MODEL = process.env.AGENT_MODEL || "gemini-3-flash-preview";
 
 const AVAILABLE_MODELS = [
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite-preview",
   "gemini-2.5-flash",
   "gemini-2.5-pro",
   "gemini-3-pro-preview",
-  "gemini-3-flash-preview",
   "gemini-3.1-pro-preview",
 ];
 
@@ -1138,30 +1139,63 @@ function isTerminalQuota(errText) {
   return false;
 }
 
-const MODEL_FALLBACK_CHAIN = {
-  "gemini-3.1-pro-preview": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
-  "gemini-3-pro-preview": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
-  "gemini-3-flash-preview": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
-  "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
-  "gemini-2.5-flash": [], // last resort, nowhere to fall
-};
+// Fallback chain: {model}@{auth} — "oauth" = Code Assist, "apikey" = Gemini API
+// OAuth models first (free), then API key models (free tier / pay-as-you-go)
+function buildFallbackChain() {
+  const oauthChain = [
+    "gemini-3-flash-preview@oauth",
+    "gemini-3-pro-preview@oauth",
+    "gemini-3.1-pro-preview@oauth",
+  ];
+  const apikeyChain = [
+    "gemini-3-flash-preview@apikey",
+    "gemini-3.1-flash-lite-preview@apikey",
+    "gemini-2.5-flash@apikey",
+  ];
+  const full = [...oauthChain, ...apikeyChain];
+
+  const chain = {};
+  for (const entry of full) {
+    chain[entry] = full.filter(e => e !== entry);
+  }
+  // Also map plain model names for initial lookup
+  for (const model of AVAILABLE_MODELS) {
+    if (!chain[model]) {
+      chain[model] = full.filter(e => !e.startsWith(model + "@"));
+    }
+  }
+  return chain;
+}
+const MODEL_FALLBACK_CHAIN = buildFallbackChain();
+
+function parseModelAuth(key) {
+  const [model, auth] = key.split("@");
+  return { model, auth: auth || null };
+}
+let forceAuth = null; // "oauth" | "apikey" | null (auto)
 let fallbackTried = new Set(); // track which models failed in current retry cycle
 
+function getCurrentKey() {
+  return forceAuth ? `${MODEL}@${forceAuth}` : MODEL;
+}
+
 function getModelFallback() {
-  const chain = MODEL_FALLBACK_CHAIN[MODEL] || [];
+  const key = getCurrentKey();
+  const chain = MODEL_FALLBACK_CHAIN[key] || MODEL_FALLBACK_CHAIN[MODEL] || [];
   for (const candidate of chain) {
-    if (!fallbackTried.has(candidate)) return candidate;
+    if (!fallbackTried.has(candidate)) {
+      // Skip oauth candidates if not authenticated, skip apikey if no key
+      const { auth } = parseModelAuth(candidate);
+      if (auth === "oauth" && !isOAuthEnabled()) continue;
+      if (auth === "apikey" && !API_KEY) continue;
+      return candidate;
+    }
   }
-  return null; // all tried
+  return null;
 }
 
 function getFlashFallback() {
-  // For terminal quota: try next model in fallback chain (not just flash)
-  const chain = MODEL_FALLBACK_CHAIN[MODEL] || [];
-  for (const candidate of chain) {
-    if (!fallbackTried.has(candidate)) return candidate;
-  }
-  return null;
+  return getModelFallback();
 }
 
 // ====== Gemini API ======
@@ -1441,19 +1475,21 @@ async function callGemini(contents) {
   await rateLimitWait();
 
   // Try restoring original model if we fell back previously
-  if (pendingRestore && MODEL !== pendingRestore) {
-    // If we hit daily quota, don't retry until cooldown expires
-    if (dailyQuotaHitAt && (Date.now() - dailyQuotaHitAt) < DAILY_QUOTA_COOLDOWN) {
-      // Skip restore attempt - still in cooldown
-    } else {
-      MODEL = pendingRestore;
-      process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL})\x1b[0m\n`);
-      pendingRestore = null;
-      dailyQuotaHitAt = null;
-      fallbackTried.clear();
-      // Strip thought/thoughtSignature from history - different models reject foreign signatures
-      stripThoughtSignatures();
-      // If restore fails with 429, we'll fall back again below
+  if (pendingRestore) {
+    const { model: restoreModel, auth: restoreAuth } = parseModelAuth(pendingRestore);
+    if (MODEL !== restoreModel || forceAuth !== (restoreAuth || null)) {
+      // If we hit daily quota, don't retry until cooldown expires
+      if (dailyQuotaHitAt && (Date.now() - dailyQuotaHitAt) < DAILY_QUOTA_COOLDOWN) {
+        // Skip restore attempt - still in cooldown
+      } else {
+        MODEL = restoreModel;
+        forceAuth = restoreAuth || null;
+        process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL}${forceAuth ? "@" + forceAuth : ""})\x1b[0m\n`);
+        pendingRestore = null;
+        dailyQuotaHitAt = null;
+        fallbackTried.clear();
+        stripThoughtSignatures();
+      }
     }
   }
 
@@ -1466,7 +1502,8 @@ async function callGemini(contents) {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       let result;
-      if (isOAuthEnabled()) {
+      const useOAuth = forceAuth === "oauth" ? true : forceAuth === "apikey" ? false : isOAuthEnabled();
+      if (useOAuth) {
         result = await callGeminiOAuthStream(contents);
       } else {
         result = await callGeminiApiKey(contents);
@@ -1480,14 +1517,16 @@ async function callGemini(contents) {
 
         // Terminal quota (daily limit) → try flash fallback
         if (isTerminalQuota(errText)) {
-          fallbackTried.add(MODEL);
+          fallbackTried.add(getCurrentKey());
           const flash = getFlashFallback();
-          if (flash && MODEL !== flash) {
+          if (flash) {
+            const { model: fbModel, auth: fbAuth } = parseModelAuth(flash);
             stopSpin();
-            process.stdout.write(`\x1b[33m  ! daily quota reached on ${MODEL}. falling back to ${flash}\x1b[0m\n`);
-            pendingRestore = MODEL;
+            process.stdout.write(`\x1b[33m  ! daily quota reached on ${getCurrentKey()}. falling back to ${flash}\x1b[0m\n`);
+            pendingRestore = getCurrentKey();
             dailyQuotaHitAt = Date.now();
-            MODEL = flash;
+            MODEL = fbModel;
+            forceAuth = fbAuth || null;
             stripThoughtSignatures();
             attempt = -1; // Reset attempts
             currentDelay = INITIAL_DELAY;
@@ -1516,12 +1555,14 @@ async function callGemini(contents) {
 
         // Auto-fallback: immediately try fallback on first 429
         if (attempt === 0) {
-          fallbackTried.add(MODEL);
+          fallbackTried.add(getCurrentKey());
           const fallback = getModelFallback();
           if (fallback) {
-            process.stdout.write(`\x1b[33m  ! 429 on ${MODEL} → ${fallback}\x1b[0m\n`);
-            pendingRestore = pendingRestore || MODEL; // remember original
-            MODEL = fallback;
+            const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
+            process.stdout.write(`\x1b[33m  ! 429 on ${getCurrentKey()} → ${fallback}\x1b[0m\n`);
+            pendingRestore = pendingRestore || getCurrentKey();
+            MODEL = fbModel;
+            forceAuth = fbAuth || null;
             stripThoughtSignatures();
             attempt = -1;
             currentDelay = INITIAL_DELAY;
@@ -1538,13 +1579,15 @@ async function callGemini(contents) {
 
       // Model not found (404) → immediate fallback, no retry
       if (isModelNotFoundError(e)) {
-        fallbackTried.add(MODEL);
+        fallbackTried.add(getCurrentKey());
         const fallback = getModelFallback();
         if (fallback) {
+          const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
           stopSpin();
-          process.stdout.write(`\x1b[33m  ! ${MODEL} not available (404). falling back to ${fallback}\x1b[0m\n`);
-          pendingRestore = pendingRestore || MODEL;
-          MODEL = fallback;
+          process.stdout.write(`\x1b[33m  ! ${getCurrentKey()} not available (404). falling back to ${fallback}\x1b[0m\n`);
+          pendingRestore = pendingRestore || getCurrentKey();
+          MODEL = fbModel;
+          forceAuth = fbAuth || null;
           stripThoughtSignatures();
           attempt = -1;
           currentDelay = INITIAL_DELAY;
