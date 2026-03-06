@@ -1052,7 +1052,6 @@ const MODEL_FALLBACK_CHAIN = {
   "gemini-2.5-pro": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
   "gemini-2.5-flash": [], // last resort, nowhere to fall
 };
-const FALLBACK_THRESHOLD_MS = 20000; // 20s: switch model instead of waiting
 let fallbackTried = new Set(); // track which models failed in current retry cycle
 
 function getModelFallback() {
@@ -1405,12 +1404,12 @@ async function callGemini(contents) {
         stopSpin();
         if (attempt === 0) process.stdout.write(`\x1b[90m  429: ${errText.substring(0, 200)}\x1b[0m\n`);
 
-        // Auto-fallback: if wait > 20s, switch model instead of waiting
-        if (waitMs > FALLBACK_THRESHOLD_MS) {
+        // Auto-fallback: immediately try fallback on first 429
+        if (attempt === 0) {
           fallbackTried.add(MODEL);
           const fallback = getModelFallback();
           if (fallback) {
-            process.stdout.write(`\x1b[33m  ! wait ${Math.ceil(waitMs / 1000)}s > ${FALLBACK_THRESHOLD_MS / 1000}s. ${MODEL} → ${fallback}\x1b[0m\n`);
+            process.stdout.write(`\x1b[33m  ! 429 on ${MODEL} → ${fallback}\x1b[0m\n`);
             pendingRestore = pendingRestore || MODEL; // remember original
             MODEL = fallback;
             attempt = -1;
