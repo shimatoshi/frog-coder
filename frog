@@ -1347,6 +1347,8 @@ async function callGemini(contents) {
     process.stdout.write(`\x1b[90m  (trying to restore: ${MODEL})\x1b[0m\n`);
     pendingRestore = null;
     fallbackTried.clear();
+    // Strip thought/thoughtSignature from history - different models reject foreign signatures
+    stripThoughtSignatures();
     // If restore fails with 429, we'll fall back again below
   }
 
@@ -1379,6 +1381,7 @@ async function callGemini(contents) {
             process.stdout.write(`\x1b[33m  ! daily quota reached on ${MODEL}. falling back to ${flash}\x1b[0m\n`);
             pendingRestore = MODEL;
             MODEL = flash;
+            stripThoughtSignatures();
             attempt = -1; // Reset attempts
             currentDelay = INITIAL_DELAY;
             continue;
@@ -1412,6 +1415,7 @@ async function callGemini(contents) {
             process.stdout.write(`\x1b[33m  ! 429 on ${MODEL} → ${fallback}\x1b[0m\n`);
             pendingRestore = pendingRestore || MODEL; // remember original
             MODEL = fallback;
+            stripThoughtSignatures();
             attempt = -1;
             currentDelay = INITIAL_DELAY;
             continue;
@@ -1434,6 +1438,7 @@ async function callGemini(contents) {
           process.stdout.write(`\x1b[33m  ! ${MODEL} not available (404). falling back to ${fallback}\x1b[0m\n`);
           pendingRestore = pendingRestore || MODEL;
           MODEL = fallback;
+          stripThoughtSignatures();
           attempt = -1;
           currentDelay = INITIAL_DELAY;
           continue;
@@ -1473,6 +1478,26 @@ function fmtArgs(args) {
 }
 
 // ====== Abort Cleanup ======
+function stripThoughtSignatures() {
+  // Remove thought/thoughtSignature from history entries.
+  // Different models reject foreign thought signatures with 400 INVALID_ARGUMENT.
+  for (const msg of history) {
+    if (!msg.parts) continue;
+    for (const part of msg.parts) {
+      delete part.thought;
+      delete part.thoughtSignature;
+    }
+    // Remove empty parts left after stripping
+    msg.parts = msg.parts.filter((p) => p.text || p.functionCall || p.functionResponse);
+  }
+  // Remove messages that became empty
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].parts && history[i].parts.length === 0) {
+      history.splice(i, 1);
+    }
+  }
+}
+
 function cleanupHistoryAfterAbort() {
   // Remove trailing model response that contains unanswered functionCalls.
   // Gemini API returns 400 INVALID_ARGUMENT if a functionCall has no matching functionResponse.
