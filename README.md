@@ -1,11 +1,11 @@
 # frog
 
 Termux (Android) で動くゼロ依存コーディングエージェント。
-Node.js 単ファイル、外部パッケージ不要。Google Gemini API でコードの読み書き・実行・デバッグを自律的に行う。
+外部パッケージ不要。Google Gemini API でコードの読み書き・実行・デバッグを自律的に行う。
 
 ## 特徴
 
-- **ゼロ依存** — `node frog` だけで動く。npm install 不要
+- **ゼロ依存** — Node.js 組み込みモジュールのみ。npm install 不要
 - **Google OAuth (PKCE)** — Gemini Code Assist API で1000回/日の無料枠
 - **API キー対応** — OAuth なしでも標準 Gemini API で利用可能
 - **モデル自動フォールバック** — 429/404 で代替モデルに即切り替え、チェイン付き
@@ -66,7 +66,7 @@ OAuth を使うと **Gemini Code Assist API**（1000回/日の無料枠）が利
 ### API キー認証
 
 ```bash
-# .env ファイルを作成（frog と同じディレクトリ）
+# .env ファイルを作成（リポジトリルートに配置）
 echo 'GEMINI_API_KEY=your_api_key_here' > .env
 frog
 ```
@@ -168,10 +168,25 @@ japanese-developer setup
 ## ファイル構成
 
 ```
-frog              メインエージェント（単ファイル、~2100行）
-install.sh        インストーラ（~/.local/bin にリンク作成）
-.env              API キー等の環境変数（任意）
-~/.frog/auth.json OAuth 認証情報（自動生成）
+frog-pkg/
+├── bin/frog          エントリーポイント（コマンドディスパッチ）
+├── src/
+│   ├── state.js      共有ミュータブル状態
+│   ├── config.js     定数・.env・システムプロンプト
+│   ├── net.js        sleep・fetchWithTimeout・レート制限
+│   ├── ui.js         スピナー・ターミナルタイトル
+│   ├── input.js      文字幅・入力処理
+│   ├── auth.js       OAuth / トークン管理
+│   ├── hooks.js      フックシステム
+│   ├── fallback.js   フォールバックチェーン・エラー分類
+│   ├── tools.js      ツール定義・実装
+│   ├── api.js        API呼び出し・リトライ・履歴管理
+│   └── agent.js      エージェントターン・サブエージェント
+├── package.json
+└── .env → ../.env    （シンボリックリンク）
+install.sh            インストーラ（~/.local/bin にリンク作成）
+.env                  API キー等の環境変数（任意）
+~/.frog/auth.json     OAuth 認証情報（自動生成）
 ```
 
 ## 環境変数
