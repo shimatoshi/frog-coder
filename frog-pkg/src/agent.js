@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import state from "./state.js";
 import {
-  CODE_ASSIST_ENDPOINT, getCodeAssistHeaders, SESSION_ID, MAX_TOOL_LOOPS,
+  CODE_ASSIST_ENDPOINT, getCodeAssistHeaders, getSessionId, MAX_TOOL_LOOPS,
 } from "./config.js";
 import { ensureValidToken, isOAuthEnabled } from "./auth.js";
 import { fetchWithTimeout, sleep, rateLimitWait } from "./net.js";
@@ -52,7 +52,7 @@ Rules:
             tools: SUB_AGENT_TOOLS,
             systemInstruction: { parts: [{ text: subSystemPrompt }] },
             generationConfig: { temperature: 0.2 },
-            session_id: SESSION_ID,
+            session_id: getSessionId(),
           },
         };
 

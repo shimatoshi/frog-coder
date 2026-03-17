@@ -70,7 +70,7 @@ function buildFallbackChain() {
   const oauthChain = [
     "gemini-3-flash-preview@oauth",
     "gemini-3-pro-preview@oauth",
-    "gemini-3.1-pro-preview@oauth",
+    "gemini-3.1-flash-lite-preview@oauth",
   ];
   const apikeyChain = [
     "gemini-3-flash-preview@apikey",
@@ -120,6 +120,7 @@ export function getFlashFallback() {
   return getModelFallback();
 }
 
+
 // ====== Error Classification ======
 export function isNetworkError(e) {
   const msg = e?.message || "";
@@ -144,7 +145,8 @@ export function isModelNotFoundError(e) {
 }
 
 export function isThoughtSignatureError(e) {
-  return e?.status === 400 || (e?.message && e.message.includes("thought_signature"));
+  return (e?.status === 400 && e?.message?.includes("thought_signature")) ||
+    (e?.message && e.message.includes("thought_signature"));
 }
 
 export const DAILY_QUOTA_COOLDOWN = 60 * 60 * 1000;

@@ -58,7 +58,16 @@ export const AVAILABLE_MODELS = [
 
 export const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
 export const MAX_TOOL_LOOPS = 30;
-export const SESSION_ID = randomUUID();
+
+export function getSessionId() {
+  if (!state.sessionId) state.sessionId = randomUUID();
+  return state.sessionId;
+}
+
+export function resetSessionId() {
+  state.sessionId = randomUUID();
+  return state.sessionId;
+}
 
 // ====== Auth Storage ======
 export const AUTH_DIR = join(homedir(), ".frog");

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import state from "./state.js";
 import {
-  CODE_ASSIST_ENDPOINT, getCodeAssistHeaders, STANDARD_API_URL, SESSION_ID,
+  CODE_ASSIST_ENDPOINT, getCodeAssistHeaders, STANDARD_API_URL, getSessionId, resetSessionId,
   saveAuth, getSystemPrompt,
 } from "./config.js";
 import { ensureValidToken, refreshAccessToken, isOAuthEnabled } from "./auth.js";
@@ -12,6 +12,13 @@ import {
   getCurrentKey, getModelFallback, getFlashFallback, parseModelAuth,
   DAILY_QUOTA_COOLDOWN,
 } from "./fallback.js";
+
+// Helper: clean up for model switches
+// Strips standalone thought parts but preserves thoughtSignature on functionCall parts
+function prepareModelSwitch() {
+  stripThoughtSignatures(true);
+  resetSessionId();
+}
 import { startSpin, stopSpin } from "./ui.js";
 import { tools } from "./tools.js";
 
@@ -59,7 +66,7 @@ export async function callGeminiOAuthStream(contents, _retried) {
       tools,
       systemInstruction: { parts: [{ text: getSystemPrompt() }] },
       generationConfig: { temperature: 0.2 },
-      session_id: SESSION_ID,
+      session_id: getSessionId(),
     },
   };
 
@@ -181,7 +188,7 @@ export async function callGeminiOAuthNonStream(contents, _retried) {
       tools,
       systemInstruction: { parts: [{ text: getSystemPrompt() }] },
       generationConfig: { temperature: 0.2 },
-      session_id: SESSION_ID,
+      session_id: getSessionId(),
     },
   };
 
@@ -220,6 +227,13 @@ export async function callGeminiOAuthNonStream(contents, _retried) {
   throw new Error("Unexpected response: " + JSON.stringify(data).substring(0, 300));
 }
 
+// ====== Thinking-capable model detection ======
+const THINKING_MODELS = /^gemini-(2\.5|3[.-])/;
+
+function isThinkingModel(model) {
+  return THINKING_MODELS.test(model);
+}
+
 // ====== API Key ======
 async function callGeminiApiKey(contents) {
   if (!state.API_KEY) throw new Error("GEMINI_API_KEY not set and OAuth not configured. Run /login");
@@ -230,6 +244,11 @@ async function callGeminiApiKey(contents) {
     systemInstruction: { parts: [{ text: getSystemPrompt() }] },
     generationConfig: { temperature: 0.2 },
   };
+
+  // Thinking models (2.5+, 3.x) require explicit thinkingConfig via standard API
+  if (isThinkingModel(state.MODEL)) {
+    body.generationConfig.thinkingConfig = { thinkingBudget: 8192 };
+  }
 
   const res = await fetchWithTimeout(
     `${STANDARD_API_URL}/models/${state.MODEL}:generateContent?key=${state.API_KEY}`,
@@ -246,7 +265,9 @@ async function callGeminiApiKey(contents) {
     if (res.status === 429) {
       throw { status: 429, text: errText };
     }
-    throw new Error(`API ${res.status}: ${errText.substring(0, 300)}`);
+    const err = new Error(`API ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 400 && errText.includes("thought_signature")) { err.status = 400; }
+    throw err;
   }
 
   const data = await res.json();
@@ -259,20 +280,42 @@ async function callGeminiApiKey(contents) {
 
 // ====== Strip Thought Signatures ======
 export function stripThoughtSignatures(force = false) {
-  if (!force && state.forceAuth === "oauth") return;
+  // force=true: always strip (used by prepareModelSwitch)
+  // force=false: skip if current model supports thinking natively
+  if (!force && (state.forceAuth === "oauth" || isThinkingModel(state.MODEL))) return;
+  let stripped = 0;
   for (const msg of state.history) {
     if (!msg.parts) continue;
     for (const part of msg.parts) {
-      delete part.thought;
-      delete part.thoughtSignature;
+      // NEVER remove thoughtSignature from functionCall parts — API requires it
+      if (part.functionCall) continue;
+      if (part.thought) { stripped++; delete part.thought; }
+      if (part.thoughtSignature) { stripped++; delete part.thoughtSignature; }
     }
-    msg.parts = msg.parts.filter((p) => p.text || p.functionCall || p.functionResponse);
+    // Remove parts that are now empty (standalone thought-only parts)
+    msg.parts = msg.parts.filter((p) => p.text || p.functionCall || p.functionResponse || p.thoughtSignature);
   }
   for (let i = state.history.length - 1; i >= 0; i--) {
     if (state.history[i].parts && state.history[i].parts.length === 0) {
       state.history.splice(i, 1);
     }
   }
+  // Debug: check what remains after strip
+  let remaining = 0;
+  const suspicious = [];
+  for (const msg of state.history) {
+    if (!msg.parts) continue;
+    for (const part of msg.parts) {
+      const keys = Object.keys(part);
+      for (const k of keys) {
+        if (k.toLowerCase().includes("thought") || k.toLowerCase().includes("signature")) {
+          remaining++;
+          suspicious.push(k);
+        }
+      }
+    }
+  }
+  process.stdout.write(`\x1b[90m  [strip] removed ${stripped} thought/sig fields. remaining suspicious: ${remaining}${suspicious.length ? " (" + [...new Set(suspicious)].join(", ") + ")" : ""}\x1b[0m\n`);
 }
 
 // ====== History Management ======
@@ -365,7 +408,7 @@ export async function callGemini(contents) {
         state.pendingRestore = null;
         state.dailyQuotaHitAt = null;
         state.fallbackTried.clear();
-        stripThoughtSignatures();
+        prepareModelSwitch();
       }
     }
   }
@@ -375,6 +418,7 @@ export async function callGemini(contents) {
   const MAX_DELAY = 30000;
 
   let currentDelay = INITIAL_DELAY;
+  let thoughtSigRetried = false;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (state.aborted) throw new Error("Aborted by user");
@@ -404,7 +448,7 @@ export async function callGemini(contents) {
             state.dailyQuotaHitAt = Date.now();
             state.MODEL = fbModel;
             state.forceAuth = fbAuth || null;
-            stripThoughtSignatures();
+            prepareModelSwitch();
             attempt = -1;
             currentDelay = INITIAL_DELAY;
             continue;
@@ -446,7 +490,7 @@ export async function callGemini(contents) {
             state.pendingRestore = state.pendingRestore || getCurrentKey();
             state.MODEL = fbModel;
             state.forceAuth = fbAuth || null;
-            stripThoughtSignatures();
+            prepareModelSwitch();
             attempt = -1;
             currentDelay = INITIAL_DELAY;
             continue;
@@ -471,7 +515,7 @@ export async function callGemini(contents) {
           state.pendingRestore = state.pendingRestore || getCurrentKey();
           state.MODEL = fbModel;
           state.forceAuth = fbAuth || null;
-          stripThoughtSignatures();
+          prepareModelSwitch();
           attempt = -1;
           currentDelay = INITIAL_DELAY;
           continue;
@@ -480,12 +524,20 @@ export async function callGemini(contents) {
       }
 
       if (isThoughtSignatureError(e)) {
-        stripThoughtSignatures(true);
-        if (attempt === 0) {
+        if (!thoughtSigRetried) {
+          // Log the actual error on first encounter for debugging
+          stopSpin();
+          process.stdout.write(`\x1b[90m  thought_sig error: ${(e.message || "").substring(0, 400)}\x1b[0m\n`);
+        }
+        prepareModelSwitch();
+        if (!thoughtSigRetried) {
+          // First try: strip + new session, retry same model
+          thoughtSigRetried = true;
           attempt = -1;
           currentDelay = INITIAL_DELAY;
           continue;
         }
+        // Still failing — fall back to next model
         state.fallbackTried.add(getCurrentKey());
         const fallback = getModelFallback();
         if (fallback) {
@@ -495,6 +547,7 @@ export async function callGemini(contents) {
           state.pendingRestore = state.pendingRestore || getCurrentKey();
           state.MODEL = fbModel;
           state.forceAuth = fbAuth || null;
+          thoughtSigRetried = false;
           attempt = -1;
           currentDelay = INITIAL_DELAY;
           continue;

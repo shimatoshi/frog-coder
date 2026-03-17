@@ -21,6 +21,7 @@ const state = {
   sessionStartContext: "",
   spinTimer: null,
   spinIdx: 0,
+  sessionId: null,
 };
 
 export default state;
