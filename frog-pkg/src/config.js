@@ -28,7 +28,7 @@ export const OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/userinfo.email",
   "https://www.googleapis.com/auth/userinfo.profile",
 ];
-export const CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+export const CODE_ASSIST_ENDPOINT = process.env.FROG_OAUTH_URL || "https://cloudcode-pa.googleapis.com";
 
 export function getCodeAssistHeaders() {
   return {
@@ -56,7 +56,7 @@ export const AVAILABLE_MODELS = [
   "gemini-3.1-pro-preview",
 ];
 
-export const STANDARD_API_URL = "https://generativelanguage.googleapis.com/v1beta";
+export const STANDARD_API_URL = process.env.FROG_API_URL || "https://generativelanguage.googleapis.com/v1beta";
 export const MAX_TOOL_LOOPS = 30;
 
 export function getSessionId() {

@@ -266,6 +266,7 @@ async function callGeminiApiKey(contents) {
       throw { status: 429, text: errText };
     }
     const err = new Error(`API ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 404) { err.status = 404; }
     if (res.status === 400 && errText.includes("thought_signature")) { err.status = 400; }
     throw err;
   }
@@ -280,15 +281,16 @@ async function callGeminiApiKey(contents) {
 
 // ====== Strip Thought Signatures ======
 export function stripThoughtSignatures(force = false) {
-  // force=true: always strip (used by prepareModelSwitch)
-  // force=false: skip if current model supports thinking natively
+  // force=true: model switch — strip ALL signatures (including functionCall).
+  //             Different model = different signature keys, foreign sigs → 400.
+  // force=false: same-model retry — keep functionCall signatures (API requires
+  //             them for the current model), skip entirely for OAuth/thinking models.
   if (!force && (state.forceAuth === "oauth" || isThinkingModel(state.MODEL))) return;
   let stripped = 0;
   for (const msg of state.history) {
     if (!msg.parts) continue;
     for (const part of msg.parts) {
-      // NEVER remove thoughtSignature from functionCall parts — API requires it
-      if (part.functionCall) continue;
+      if (!force && part.functionCall) continue; // same-model: preserve functionCall sigs
       if (part.thought) { stripped++; delete part.thought; }
       if (part.thoughtSignature) { stripped++; delete part.thoughtSignature; }
     }
