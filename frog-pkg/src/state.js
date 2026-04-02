@@ -17,6 +17,7 @@ const state = {
   fallbackTried: new Set(),
   pendingRestore: null,
   dailyQuotaHitAt: null,
+  lastFallbackAt: null,
   hooksConfig: null,
   sessionStartContext: "",
   spinTimer: null,

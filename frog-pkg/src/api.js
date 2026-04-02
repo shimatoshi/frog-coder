@@ -17,6 +17,7 @@ import {
 function prepareModelSwitch() {
   stripThoughtSignatures(true);
   resetSessionId();
+  state.lastFallbackAt = Date.now();
 }
 import { startSpin, stopSpin } from "./ui.js";
 import { tools } from "./tools.js";
@@ -394,7 +395,10 @@ export async function callGemini(contents) {
   if (state.pendingRestore) {
     const { model: restoreModel, auth: restoreAuth } = parseModelAuth(state.pendingRestore);
     if (state.MODEL !== restoreModel || state.forceAuth !== (restoreAuth || null)) {
-      if (state.dailyQuotaHitAt && (Date.now() - state.dailyQuotaHitAt) < DAILY_QUOTA_COOLDOWN) {
+      const RESTORE_COOLDOWN = 60000; // don't try restore within 60s of last fallback
+      const cooldownActive = state.dailyQuotaHitAt && (Date.now() - state.dailyQuotaHitAt) < DAILY_QUOTA_COOLDOWN;
+      const tooSoon = state.lastFallbackAt && (Date.now() - state.lastFallbackAt) < RESTORE_COOLDOWN;
+      if (cooldownActive || tooSoon) {
         // Skip restore - still in cooldown
       } else {
         state.MODEL = restoreModel;
@@ -402,6 +406,7 @@ export async function callGemini(contents) {
         process.stdout.write(`\x1b[90m  (trying to restore: ${state.MODEL}${state.forceAuth ? "@" + state.forceAuth : ""})\x1b[0m\n`);
         state.pendingRestore = null;
         state.dailyQuotaHitAt = null;
+        state.lastFallbackAt = null;
         state.fallbackTried.clear();
         prepareModelSwitch();
       }
