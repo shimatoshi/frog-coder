@@ -30,13 +30,31 @@ function isModelNotFoundError(e) {
   return e?.status === 404 || (e?.message && /404.*[Nn]ot [Ff]ound/.test(e.message));
 }
 
-// Matches the FIXED stripThoughtSignatures
-function stripThoughtSignatures(history, force, forceAuth, MODEL) {
+// Matches the FIXED stripThoughtSignatures (with convertTools support)
+function stripThoughtSignatures(history, force, forceAuth, MODEL, convertTools = false) {
   if (!force && (forceAuth === "oauth" || THINKING_MODELS.test(MODEL))) return;
   for (const msg of history) {
     if (!msg.parts) continue;
-    for (const part of msg.parts) {
+    for (let i = 0; i < msg.parts.length; i++) {
+      const part = msg.parts[i];
       if (!force && part.functionCall) continue; // same-model: preserve functionCall sigs
+
+      // Cross-auth switch: convert functionCall to text to avoid signature catch-22
+      if (convertTools && part.functionCall) {
+        const fc = part.functionCall;
+        const argStr = fc.args ? JSON.stringify(fc.args) : "{}";
+        const summary = argStr.length > 200 ? argStr.substring(0, 200) + "..." : argStr;
+        msg.parts[i] = { text: `[Tool call: ${fc.name}(${summary})]` };
+        continue;
+      }
+      if (convertTools && part.functionResponse) {
+        const fr = part.functionResponse;
+        const resStr = fr.response ? JSON.stringify(fr.response) : "";
+        const summary = resStr.length > 500 ? resStr.substring(0, 500) + "..." : resStr;
+        msg.parts[i] = { text: `[Tool result: ${fr.name}: ${summary}]` };
+        continue;
+      }
+
       if (part.thought) { delete part.thought; }
       if (part.thoughtSignature) { delete part.thoughtSignature; }
     }
@@ -215,7 +233,7 @@ console.log("\n\x1b[1m=== Integration: OAuth→OAuth model switch ===\x1b[0m\n")
   assert(!fc.thoughtSignature, "functionCall sig gone → no 400 on new model");
 }
 
-console.log("\n\x1b[1m=== Integration: OAuth→APIkey model switch ===\x1b[0m\n");
+console.log("\n\x1b[1m=== Integration: OAuth→APIkey model switch (no convertTools) ===\x1b[0m\n");
 
 {
   const history = [
@@ -230,11 +248,70 @@ console.log("\n\x1b[1m=== Integration: OAuth→APIkey model switch ===\x1b[0m\n"
     ]},
   ];
 
-  stripThoughtSignatures(history, true, "apikey", "gemini-2.5-flash");
+  // force=true but convertTools=false (same auth type switch)
+  stripThoughtSignatures(history, true, "apikey", "gemini-2.5-flash", false);
 
   const fc = history[1].parts.find(p => p.functionCall);
-  assert(!fc.thoughtSignature, "OAuth→APIkey: functionCall sig stripped (standard API doesn't need it)");
+  assert(!fc.thoughtSignature, "OAuth→APIkey: functionCall sig stripped");
   assert(fc.functionCall.name === "ls", "functionCall data intact");
+}
+
+console.log("\n\x1b[1m=== Integration: OAuth→APIkey with convertTools (cross-auth) ===\x1b[0m\n");
+
+{
+  const history = [
+    { role: "user", parts: [{ text: "help" }] },
+    { role: "model", parts: [
+      { thought: true, text: "thinking", thoughtSignature: "oauth_sig" },
+      { text: "done" },
+      { functionCall: { name: "list_directory", args: { path: "src" } }, thoughtSignature: "oauth_fc_sig" },
+    ]},
+    { role: "user", parts: [
+      { functionResponse: { name: "list_directory", response: { files: ["a.js", "b.js"] } } },
+    ]},
+  ];
+
+  // convertTools=true: functionCall/functionResponse become text summaries
+  stripThoughtSignatures(history, true, "apikey", "gemini-3-flash-preview", true);
+
+  // No functionCall parts should remain
+  const allParts = history.flatMap(m => m.parts || []);
+  assert(!allParts.some(p => p.functionCall), "convertTools: no functionCall parts remain");
+  assert(!allParts.some(p => p.functionResponse), "convertTools: no functionResponse parts remain");
+
+  // Should have text summaries instead
+  const toolCallText = allParts.find(p => p.text?.includes("[Tool call:"));
+  assert(toolCallText, "convertTools: functionCall converted to text summary");
+  assert(toolCallText.text.includes("list_directory"), "convertTools: tool name preserved in summary");
+
+  const toolResultText = allParts.find(p => p.text?.includes("[Tool result:"));
+  assert(toolResultText, "convertTools: functionResponse converted to text summary");
+
+  // Thought/signature should also be stripped
+  assert(!allParts.some(p => p.thought), "convertTools: thoughts also stripped");
+  assert(!allParts.some(p => p.thoughtSignature), "convertTools: signatures also stripped");
+}
+
+console.log("\n\x1b[1m=== Integration: OAuth→OAuth (same auth, no convertTools) ===\x1b[0m\n");
+
+{
+  const history = [
+    { role: "user", parts: [{ text: "help" }] },
+    { role: "model", parts: [
+      { functionCall: { name: "read_file", args: { path: "x.js" } }, thoughtSignature: "sig1" },
+    ]},
+    { role: "user", parts: [
+      { functionResponse: { name: "read_file", response: { content: "hello" } } },
+    ]},
+  ];
+
+  // Same auth (oauth→oauth), just model switch: should NOT convert tools
+  stripThoughtSignatures(history, true, "oauth", "gemini-3-pro-preview", false);
+
+  const fc = history[1].parts.find(p => p.functionCall);
+  assert(fc, "OAuth→OAuth: functionCall preserved (same auth, no convert)");
+  assert(!fc.thoughtSignature, "OAuth→OAuth: signature stripped");
+  assert(fc.functionCall.name === "read_file", "OAuth→OAuth: functionCall data intact");
 }
 
 // ============================================================

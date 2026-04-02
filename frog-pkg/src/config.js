@@ -134,5 +134,6 @@ Rules:
 - Be concise. Under 3 lines of text output unless explaining complex changes.
 - Respond in the same language the user uses
 - NEVER run interactive commands. Use non-interactive flags (-y, --yes, -m, etc.)
-- Do NOT explore aimlessly. If you cannot find something in 2-3 searches, ask the user.`
+- Do NOT explore aimlessly. If you cannot find something in 2-3 searches, ask the user.
+- For greetings, casual conversation, or questions that do NOT require code changes, respond with text only. Do NOT call any tools unless the user asks for a coding task.`
 + (state.sessionStartContext ? `\n\n${state.sessionStartContext}` : "");

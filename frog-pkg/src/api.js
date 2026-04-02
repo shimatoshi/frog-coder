@@ -5,7 +5,7 @@ import {
   saveAuth, getSystemPrompt,
 } from "./config.js";
 import { ensureValidToken, refreshAccessToken, isOAuthEnabled } from "./auth.js";
-import { fetchWithTimeout, sleep, rateLimitWait } from "./net.js";
+import { fetchWithTimeout, sleep, rateLimitWait, markRateLimited } from "./net.js";
 import {
   parseRetryDelay, isTerminalQuota, isNetworkError, isRateLimitError,
   isModelNotFoundError, isThoughtSignatureError,
@@ -13,10 +13,18 @@ import {
   DAILY_QUOTA_COOLDOWN,
 } from "./fallback.js";
 
+// Resolve effective auth type (oauth or apikey)
+function effectiveAuth() {
+  if (state.forceAuth === "oauth") return "oauth";
+  if (state.forceAuth === "apikey") return "apikey";
+  return isOAuthEnabled() ? "oauth" : "apikey";
+}
+
 // Helper: clean up for model switches
-// Strips standalone thought parts but preserves thoughtSignature on functionCall parts
-function prepareModelSwitch() {
-  stripThoughtSignatures(true);
+// authSwitch=true: converting functionCalls to text (cross-auth switches)
+// authSwitch=false: strip signatures only (same-auth model switches)
+function prepareModelSwitch(authSwitch = false) {
+  stripThoughtSignatures(true, authSwitch);
   resetSessionId();
 }
 import { startSpin, stopSpin } from "./ui.js";
@@ -280,17 +288,38 @@ async function callGeminiApiKey(contents) {
 }
 
 // ====== Strip Thought Signatures ======
-export function stripThoughtSignatures(force = false) {
-  // force=true: model switch — strip ALL signatures (including functionCall).
-  //             Different model = different signature keys, foreign sigs → 400.
-  // force=false: same-model retry — keep functionCall signatures (API requires
-  //             them for the current model), skip entirely for OAuth/thinking models.
+export function stripThoughtSignatures(force = false, convertTools = false) {
+  // force=true:  model switch — strip ALL thought/signature fields.
+  // convertTools: also convert functionCall/functionResponse to text summaries
+  //               (needed for cross-auth switches where signatures become invalid
+  //                AND the target API requires them — catch-22).
+  // force=false: same-model retry — keep functionCall signatures, skip for OAuth/thinking.
   if (!force && (state.forceAuth === "oauth" || isThinkingModel(state.MODEL))) return;
   let stripped = 0;
   for (const msg of state.history) {
     if (!msg.parts) continue;
-    for (const part of msg.parts) {
+    for (let i = 0; i < msg.parts.length; i++) {
+      const part = msg.parts[i];
       if (!force && part.functionCall) continue; // same-model: preserve functionCall sigs
+
+      // Cross-auth switch: convert functionCall to text to avoid signature catch-22
+      if (convertTools && part.functionCall) {
+        const fc = part.functionCall;
+        const argStr = fc.args ? JSON.stringify(fc.args) : "{}";
+        const summary = argStr.length > 200 ? argStr.substring(0, 200) + "..." : argStr;
+        msg.parts[i] = { text: `[Tool call: ${fc.name}(${summary})]` };
+        stripped++;
+        continue;
+      }
+      if (convertTools && part.functionResponse) {
+        const fr = part.functionResponse;
+        const resStr = fr.response ? JSON.stringify(fr.response) : "";
+        const summary = resStr.length > 500 ? resStr.substring(0, 500) + "..." : resStr;
+        msg.parts[i] = { text: `[Tool result: ${fr.name}: ${summary}]` };
+        stripped++;
+        continue;
+      }
+
       if (part.thought) { stripped++; delete part.thought; }
       if (part.thoughtSignature) { stripped++; delete part.thoughtSignature; }
     }
@@ -302,22 +331,7 @@ export function stripThoughtSignatures(force = false) {
       state.history.splice(i, 1);
     }
   }
-  // Debug: check what remains after strip
-  let remaining = 0;
-  const suspicious = [];
-  for (const msg of state.history) {
-    if (!msg.parts) continue;
-    for (const part of msg.parts) {
-      const keys = Object.keys(part);
-      for (const k of keys) {
-        if (k.toLowerCase().includes("thought") || k.toLowerCase().includes("signature")) {
-          remaining++;
-          suspicious.push(k);
-        }
-      }
-    }
-  }
-  process.stdout.write(`\x1b[90m  [strip] removed ${stripped} thought/sig fields. remaining suspicious: ${remaining}${suspicious.length ? " (" + [...new Set(suspicious)].join(", ") + ")" : ""}\x1b[0m\n`);
+  process.stdout.write(`\x1b[90m  [strip] converted/removed ${stripped} thought/sig/tool fields\x1b[0m\n`);
 }
 
 // ====== History Management ======
@@ -404,13 +418,14 @@ export async function callGemini(contents) {
       if (state.dailyQuotaHitAt && (Date.now() - state.dailyQuotaHitAt) < DAILY_QUOTA_COOLDOWN) {
         // Skip restore - still in cooldown
       } else {
+        const prevAuth = effectiveAuth();
         state.MODEL = restoreModel;
         state.forceAuth = restoreAuth || null;
         process.stdout.write(`\x1b[90m  (trying to restore: ${state.MODEL}${state.forceAuth ? "@" + state.forceAuth : ""})\x1b[0m\n`);
         state.pendingRestore = null;
         state.dailyQuotaHitAt = null;
         state.fallbackTried.clear();
-        prepareModelSwitch();
+        prepareModelSwitch(prevAuth !== effectiveAuth());
       }
     }
   }
@@ -437,6 +452,7 @@ export async function callGemini(contents) {
       return result;
     } catch (e) {
       if (isRateLimitError(e)) {
+        markRateLimited();
         const errText = typeof e.text === "string" ? e.text : e.message || "";
 
         if (isTerminalQuota(errText)) {
@@ -446,11 +462,12 @@ export async function callGemini(contents) {
             const { model: fbModel, auth: fbAuth } = parseModelAuth(flash);
             stopSpin();
             process.stdout.write(`\x1b[33m  ! daily quota reached on ${getCurrentKey()}. falling back to ${flash}\x1b[0m\n`);
+            const prevAuth = effectiveAuth();
             state.pendingRestore = getCurrentKey();
             state.dailyQuotaHitAt = Date.now();
             state.MODEL = fbModel;
             state.forceAuth = fbAuth || null;
-            prepareModelSwitch();
+            prepareModelSwitch(prevAuth !== effectiveAuth());
             attempt = -1;
             currentDelay = INITIAL_DELAY;
             continue;
@@ -475,24 +492,26 @@ export async function callGemini(contents) {
         stopSpin();
         if (attempt === 0) process.stdout.write(`\x1b[90m  429: ${errText.substring(0, 200)}\x1b[0m\n`);
 
-        if (attempt === 0 && serverDelay > 0 && serverDelay <= 5) {
-          const retryMs = serverDelay * 1000 + 500;
-          process.stdout.write(`\x1b[33m  ! rate limit. server says ${serverDelay}s, waiting ${Math.ceil(retryMs / 1000)}s...\x1b[0m\n`);
+        // Short reset (≤10s): wait and retry up to 3 times before falling back
+        if (attempt < 3 && serverDelay > 0 && serverDelay <= 10) {
+          const retryMs = serverDelay * 1000 + 1500;
+          process.stdout.write(`\x1b[33m  ! rate limit. server says ${serverDelay}s, waiting ${Math.ceil(retryMs / 1000)}s (attempt ${attempt + 1})...\x1b[0m\n`);
           startSpin(`retrying in ${Math.ceil(retryMs / 1000)}s...`);
           await sleep(retryMs);
           continue;
         }
 
-        if (attempt <= 1) {
+        if (attempt <= 3) {
           state.fallbackTried.add(getCurrentKey());
           const fallback = getModelFallback();
           if (fallback) {
             const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
             process.stdout.write(`\x1b[33m  ! 429 on ${getCurrentKey()} → ${fallback}\x1b[0m\n`);
+            const prevAuth = effectiveAuth();
             state.pendingRestore = state.pendingRestore || getCurrentKey();
             state.MODEL = fbModel;
             state.forceAuth = fbAuth || null;
-            prepareModelSwitch();
+            prepareModelSwitch(prevAuth !== effectiveAuth());
             attempt = -1;
             currentDelay = INITIAL_DELAY;
             continue;
@@ -514,10 +533,11 @@ export async function callGemini(contents) {
           const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
           stopSpin();
           process.stdout.write(`\x1b[33m  ! ${getCurrentKey()} not available (404). falling back to ${fallback}\x1b[0m\n`);
+          const prevAuth = effectiveAuth();
           state.pendingRestore = state.pendingRestore || getCurrentKey();
           state.MODEL = fbModel;
           state.forceAuth = fbAuth || null;
-          prepareModelSwitch();
+          prepareModelSwitch(prevAuth !== effectiveAuth());
           attempt = -1;
           currentDelay = INITIAL_DELAY;
           continue;
@@ -531,9 +551,9 @@ export async function callGemini(contents) {
           stopSpin();
           process.stdout.write(`\x1b[90m  thought_sig error: ${(e.message || "").substring(0, 400)}\x1b[0m\n`);
         }
-        prepareModelSwitch();
+        // First try: strip sigs + convert tools to text (solves catch-22), retry same model
+        prepareModelSwitch(true);
         if (!thoughtSigRetried) {
-          // First try: strip + new session, retry same model
           thoughtSigRetried = true;
           attempt = -1;
           currentDelay = INITIAL_DELAY;
@@ -546,12 +566,14 @@ export async function callGemini(contents) {
           const { model: fbModel, auth: fbAuth } = parseModelAuth(fallback);
           stopSpin();
           process.stdout.write(`\x1b[33m  ! 400 thought_signature on ${getCurrentKey()} → ${fallback}\x1b[0m\n`);
+          const prevAuth = effectiveAuth();
           state.pendingRestore = state.pendingRestore || getCurrentKey();
           state.MODEL = fbModel;
           state.forceAuth = fbAuth || null;
           thoughtSigRetried = false;
           attempt = -1;
           currentDelay = INITIAL_DELAY;
+          prepareModelSwitch(prevAuth !== effectiveAuth());
           continue;
         }
         throw e;

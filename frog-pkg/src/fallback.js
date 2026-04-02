@@ -67,25 +67,42 @@ export function isTerminalQuota(errText) {
 
 // ====== Fallback Chain ======
 function buildFallbackChain() {
-  const oauthChain = [
+  // Order: try different models first (same auth), then cross-auth as last resort.
+  // IMPORTANT: never fall back to the same model on the same auth — same quota!
+  const oauthModels = [
     "gemini-3-flash-preview@oauth",
     "gemini-3-pro-preview@oauth",
-    "gemini-3.1-flash-lite-preview@oauth",
   ];
-  const apikeyChain = [
-    "gemini-3-flash-preview@apikey",
-    "gemini-3.1-flash-lite-preview@apikey",
+  const apikeyModels = [
     "gemini-2.5-flash@apikey",
+    "gemini-3-flash-preview@apikey",
   ];
-  const full = [...oauthChain, ...apikeyChain];
 
   const chain = {};
-  for (const entry of full) {
-    chain[entry] = full.filter(e => e !== entry);
+
+  // For each OAuth entry, try other OAuth models first, then apikey models
+  for (const entry of oauthModels) {
+    chain[entry] = [
+      ...oauthModels.filter(e => e !== entry),
+      ...apikeyModels,
+    ];
   }
+  // For each apikey entry, try other apikey models first, then OAuth models
+  for (const entry of apikeyModels) {
+    chain[entry] = [
+      ...apikeyModels.filter(e => e !== entry),
+      ...oauthModels,
+    ];
+  }
+
+  // For bare model names (no @auth suffix), build chain excluding same-model entries
   for (const model of AVAILABLE_MODELS) {
     if (!chain[model]) {
-      chain[model] = full.filter(e => !e.startsWith(model + "@"));
+      // Skip same model with different auth (same quota), prefer different models
+      const others = [...oauthModels, ...apikeyModels].filter(
+        e => !e.startsWith(model + "@")
+      );
+      chain[model] = others;
     }
   }
   return chain;
