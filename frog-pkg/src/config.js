@@ -1,7 +1,7 @@
 import {
   readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import state from "./state.js";
@@ -32,8 +32,7 @@ export const CODE_ASSIST_ENDPOINT = process.env.FROG_OAUTH_URL || "https://cloud
 
 export function getCodeAssistHeaders() {
   return {
-    "User-Agent": `GeminiCLI/0.36.0/${state.MODEL} (${process.platform}; ${process.arch}; cli)`,
-    "x-goog-api-client": "gax-js/4.2.2 gl-node/22.0.0",
+    "User-Agent": `GeminiCLI/0.5.0/${state.MODEL} (${process.platform}; ${process.arch}; terminal)`,
   };
 }
 
